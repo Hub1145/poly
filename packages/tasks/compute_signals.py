@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 _STRATEGY_TAG_FILTER = {
     "laddering":          {"Weather"},
     "weather_prediction": {"Weather"},
-    "disaster":           {"Natural Disasters", "Weather"},
+    "disaster":           {"Natural Disasters"},
     "seismic":            {"Earthquakes", "Natural Disasters"},
     "no_bias":            {"Politics", "Pop Culture", "Entertainment", "Business"},
 }
@@ -20,7 +20,7 @@ _STRATEGY_TAG_FILTER = {
 _STRATEGY_KEYWORDS = {
     "laddering":          ["temperature", "heat", "cold", "degrees", "highest", "lowest"],
     "weather_prediction": ["temperature", "heat", "cold", "degrees", "highest", "lowest"],
-    "disaster":           ["hurricane", "flood", "storm", "warning", "watch", "emergency"],
+    "disaster":           ["hurricane", "cyclone", "typhoon", "flood", "wildfire", "blizzard", "avalanche", "landslide", "tsunami"],
     "seismic":            ["earthquake", "magnitude", "seismic", "richter", "tsunami"],
 }
 

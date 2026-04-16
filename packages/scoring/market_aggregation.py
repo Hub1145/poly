@@ -198,10 +198,19 @@ async def _build_external_signal(
 
     # laddering / disaster — single-model Open-Meteo forecast
     if edge == 0.0 and strategy in ("laddering", "disaster"):
-        _wx = await compute_weather_alpha(market_q, "YES", yes_price)
-        if isinstance(_wx, tuple):
-            edge, ext_narrative = _wx
-        source_label = "weather"
+        # disaster strategy must NOT score temperature-threshold markets —
+        # those belong to laddering/weather_prediction only.
+        _temp_kw = ("temperature", "degrees", "celsius", "fahrenheit",
+                    "heat index", "feels like", "high of", "low of",
+                    "record high", "record low")
+        _is_temp_market = any(kw in market_q.lower() for kw in _temp_kw)
+        if strategy == "disaster" and _is_temp_market:
+            pass   # skip — not a disaster market
+        else:
+            _wx = await compute_weather_alpha(market_q, "YES", yes_price)
+            if isinstance(_wx, tuple):
+                edge, ext_narrative = _wx
+            source_label = "weather"
 
     if edge == 0.0:
         return None
