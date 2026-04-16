@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Polymarket Alpha V2</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='css/style.css') }}">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono&display=swap" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo-section">
+                <h1>Polymarket Alpha V2</h1>
+                <p>High-Conceit Skilled Trader & Bayesian Signal Engine</p>
+            </div>
+            <div class="control-section">
+                <div class="status-indicator">
+                    <span class="dot" id="status-dot"></span>
+                    <span id="status-text">Disconnected</span>
+                </div>
+                <button id="main-control-btn" class="btn btn-success" style="width: 120px;">Start Bot</button>
+            </div>
+        </header>
+
+        <nav class="tabs">
+            <button class="tab-btn active" data-tab="dashboard">Dashboard</button>
+            <button class="tab-btn" data-tab="positions">Open Positions</button>
+            <button class="tab-btn" data-tab="scan">Alpha Scan</button>
+            <button class="tab-btn" data-tab="news">Alpha Feed</button>
+            <button class="tab-btn" data-tab="dev">Signal Analysis</button>
+            <button class="tab-btn" data-tab="settings">Settings</button>
+        </nav>
+
+        <main id="tab-content">
+            <!-- Dashboard Tab -->
+            <section id="dashboard" class="tab-pane active">
+                <div class="grid">
+                    <div class="card">
+                        <h3><i data-lucide="trending-up"></i> Alpha Performance</h3>
+                        <div class="metrics-grid">
+                            <div class="metric-item">
+                                <span class="metric-value" id="m-trades">0</span>
+                                <span class="metric-label">Total Alpha Trades</span>
+                            </div>
+                            <div class="metric-item">
+                                <span class="metric-value" id="m-winrate">0%</span>
+                                <span class="metric-label">Signal Precision</span>
+                            </div>
+                            <div class="metric-item">
+                                <span class="metric-value" id="m-profit">$0.00</span>
+                                <span class="metric-label">Total PnL</span>
+                            </div>
+                            <div class="metric-item">
+                                <span class="metric-value" id="m-balance">$0.00</span>
+                                <span class="metric-label">Balance</span>
+                            </div>
+                            <div class="metric-item">
+                                <span class="metric-value" id="m-markets">0</span>
+                                <span class="metric-label">High-Conviction Markets</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="card">
+                        <h3><i data-lucide="activity"></i> Bayesian Signal Stream</h3>
+                        <div class="log-container" id="log-display">
+                            <div class="log-entry">Waiting for signal engine initialization...</div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Positions Tab -->
+            <section id="positions" class="tab-pane" style="display: none;">
+                <div class="card">
+                    <h3><i data-lucide="briefcase"></i> Active Alpha Positions</h3>
+                    <div class="table-scroll" style="max-height: 300px;">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Market</th>
+                                    <th>Side</th>
+                                    <th>Size</th>
+                                    <th>Entry</th>
+                                    <th>Signal Type</th>
+                                </tr>
+                            </thead>
+                            <tbody id="positions-table">
+                                <!-- JS populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <div class="card" style="margin-top: 20px;">
+                    <h3><i data-lucide="check-circle"></i> Resolved Signals</h3>
+                    <div class="table-scroll" style="max-height: 300px;">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Market</th>
+                                    <th>Side</th>
+                                    <th>Size</th>
+                                    <th>Profit/Loss</th>
+                                    <th>Resolved At</th>
+                                </tr>
+                            </thead>
+                            <tbody id="resolved-table">
+                                <!-- JS populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Market Scan Tab -->
+            <section id="scan" class="tab-pane" style="display: none;">
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin-bottom: 0;"><i data-lucide="brain"></i> Bayesian Alpha Discovery</h3>
+                        <span id="scan-count-badge" class="side-badge yes">0 Alpha Signals Found</span>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Market Question</th>
+                                    <th>Alpha Score</th>
+                                    <th>Conviction</th>
+                                    <th>Liquidity</th>
+                                    <th>Skilled Reason</th>
+                                </tr>
+                            </thead>
+                            <tbody id="scan-table">
+                                <!-- JS populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- News Tab -->
+            <section id="news" class="tab-pane" style="display: none;">
+                <div class="card">
+                    <h3><i data-lucide="rss"></i> Skilled Trader (Alpha Feed)</h3>
+                    <div class="table-scroll">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Trader</th>
+                                    <th>Label</th>
+                                    <th>Activity</th>
+                                    <th>Impact</th>
+                                    <th>Summary</th>
+                                </tr>
+                            </thead>
+                            <tbody id="news-table">
+                                <!-- JS populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Dev Check Tab -->
+            <section id="dev" class="tab-pane" style="display: none;">
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                        <h3 style="margin-bottom: 0;"><i data-lucide="fingerprint"></i> Bayesian Signal Attribution</h3>
+                        <button id="download-logs-btn" class="btn btn-primary btn-sm" style="padding: 5px 12px; font-size: 0.8rem;">
+                            <i data-lucide="download" style="width: 14px; height: 14px; margin-right: 5px;"></i> Download Audit
+                        </button>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="data-table">
+                            <thead>
+                                <tr>
+                                    <th>Timestamp</th>
+                                    <th>Market & Bias</th>
+                                    <th>Signal Attribution</th>
+                                    <th>Leading Traders</th>
+                                    <th>Evidence</th>
+                                </tr>
+                            </thead>
+                            <tbody id="dev-table">
+                                <!-- JS populated -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+
+            <!-- Settings Tab -->
+            <section id="settings" class="tab-pane" style="display: none;">
+                <div class="grid">
+                    <div class="card">
+                        <h3><i data-lucide="settings"></i> Bot Configuration</h3>
+                        <form id="settings-form">
+                            <div class="form-group">
+                                <label>Trading Strategy</label>
+                                <select id="s-strategy" class="form-control">
+                                    <optgroup label="Bayesian Alpha (Cross-Domain)">
+                                        <option value="bayesian_ensemble">Bayesian Ensemble (Default)</option>
+                                        <option value="conservative_snw">Conservative Alpha (SNW Only)</option>
+                                        <option value="aggressive_whale">Aggressive Whale Momentum</option>
+                                        <option value="specialist_precision">Topic Specialist Precision</option>
+                                    </optgroup>
+                                    <optgroup label="Market Structure Edges">
+                                        <option value="no_bias">NO Bias Exploitation (Retail YES Overpricing)</option>
+                                        <option value="black_swan">Black Swan Tail Bets ($0.02–$0.08)</option>
+                                        <option value="long_range">Long-Range Forecast (Domain Experts)</option>
+                                        <option value="volatility">Volatility Arbitrage (Whale Conviction)</option>
+                                    </optgroup>
+                                    <optgroup label="Weather Specialist">
+                                        <option value="weather_prediction">Weather Prediction (ECMWF 51-Member Ensemble)</option>
+                                        <option value="laddering">Temperature Ladder — Adjacent Buckets (neobrother)</option>
+                                        <option value="disaster">Disaster Early Warning</option>
+                                    </optgroup>
+                                    <optgroup label="Geophysical / External Data">
+                                        <option value="seismic">Seismic / Earthquake (USGS)</option>
+                                    </optgroup>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Trading Mode</label>
+                                <select id="s-mode">
+                                    <option value="true">Paper Trading (Simulation)</option>
+                                    <option value="false">Live Trading (Mainnet)</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label>Position Size (USDC)</label>
+                                <input type="number" id="s-amount" step="0.1" value="10.0">
+                            </div>
+                            <div class="form-group">
+                                <label>Minimum Edge (%)</label>
+                                <input type="number" id="s-edge" step="0.01" value="0.20">
+                            </div>
+                            <div class="form-group">
+                                <label>Market Refresh Interval (Minutes, min 30)</label>
+                                <input type="number" id="s-interval" value="30" min="30">
+                            </div>
+                            <div class="form-group">
+                                <label>Initial Paper Balance ($)</label>
+                                <input type="number" id="s-balance" value="1000">
+                            </div>
+                            <div class="form-group">
+                                <label>Max Open Trades</label>
+                                <input type="number" id="s-max-trades" value="10">
+                            </div>
+                            <button type="submit" class="btn btn-primary">Save Settings</button>
+                        </form>
+                    </div>
+                    <div class="card">
+                        <h3><i data-lucide="key"></i> Wallet</h3>
+                        <p style="font-size: 0.8rem; color: var(--text-dim); margin-bottom: 10px;">
+                            Only your private key is needed. CLOB API credentials are derived from it automatically at startup.
+                        </p>
+                        <div class="form-group">
+                            <label>Private Key (Live Mode Only)</label>
+                            <input type="password" id="s-pk" placeholder="0x...">
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="{{ url_for('static', path='js/app.js') }}"></script>
+    <script>
+        lucide.createIcons();
+    </script>
+</body>
+</html>

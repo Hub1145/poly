@@ -1,0 +1,43 @@
+# Polymarket Alpha V2 - runtime dependencies
+# Install with: pip install -r requirements.txt
+
+# Web framework
+fastapi>=0.109.0
+uvicorn>=0.27.0
+python-multipart>=0.0.6
+fastapi-socketio>=0.0.10
+jinja2>=3.1.3
+
+# Database
+sqlalchemy>=2.0.25
+alembic>=1.13.1
+aiosqlite>=0.19.0
+
+# Config / validation
+pydantic>=2.5.3
+pydantic-settings>=2.1.0
+
+# HTTP clients
+httpx>=0.26.0
+
+# Data / math
+numpy>=1.26.3
+pandas>=2.2.0
+scipy>=1.12.0
+
+# Crypto / wallet (address derivation only)
+eth-account>=0.10.0
+
+# Polymarket SDK — authenticated trade fetch and live CLOB trading
+py-clob-client>=0.18.0
+
+# Auth helpers (kept for future auth endpoints)
+python-jose[cryptography]>=3.3.0
+passlib[bcrypt]>=1.7.4
+
+# %% Dev / test (not needed in production) %%
+# pytest>=8.0.0
+# pytest-asyncio>=0.23.5
+# black>=24.1.1
+# isort>=5.13.2
+# mypy>=1.8.0
