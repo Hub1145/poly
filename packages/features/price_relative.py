@@ -37,6 +37,8 @@ async def compute_clv(
         for r in rows
     ])
     df.set_index("timestamp", inplace=True)
+    # Deduplicate index — duplicate timestamps cause get_indexer(method="nearest") to fail
+    df = df[~df.index.duplicated(keep="last")]
 
     results = {}
     for horizon in horizons:

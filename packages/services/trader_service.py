@@ -305,7 +305,7 @@ class TraderService:
         if not valid_ids:
             return 0
 
-        sem = asyncio.Semaphore(20)
+        sem = asyncio.Semaphore(5)
 
         async def _fetch(asset_id: str):
             async with sem:
