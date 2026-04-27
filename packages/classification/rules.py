@@ -11,9 +11,9 @@ def classify_trader(profile) -> Tuple[str, float, str]:
 
     Segments (in priority order):
       market_maker         – buys AND sells the same market; signal is noise
-      topic_specialist     – mediocre globally but high CLV in one domain
-      whale                – large notional, directional conviction
-      serious_non_whale    – moderate size but consistently early + correct (best signal)
+      serious_non_whale    – globally consistent early-entry edge (best signal overall)
+      topic_specialist     – domain-specific CLV edge, modest global CLV
+      whale                – large avg notional, directional conviction
       noise                – too few trades to evaluate
       directional_discretionary – catch-all with some conviction
     """
@@ -21,7 +21,6 @@ def classify_trader(profile) -> Tuple[str, float, str]:
     # 1. Market Maker – filter out first; their trades are uninformative   #
     #    Low directional purity = consistently both sides = liquidity role #
     # ------------------------------------------------------------------ #
-    # Docs: purity < 0.30, trade_count >= 30
     if profile.directional_purity < 0.30 and profile.total_trades >= 30:
         return (
             "market_maker",
@@ -31,58 +30,64 @@ def classify_trader(profile) -> Tuple[str, float, str]:
         )
 
     # ------------------------------------------------------------------ #
-    # 2. Topic Specialist – domain-specific edge (research Section 5)      #
-    #    Identified by an above-average gamma_score (topic CLV) even if    #
-    #    global avg_clv is modest.  Minimum trade sample to avoid noise.   #
+    # 2. Serious Non-Whale (SNW) – globally consistent early-entry edge.  #
+    #    Research identifies these as the best overall signal: high CLV   #
+    #    across market domains (not just one topic) on a meaningful trade #
+    #    count.  Priority above topic_specialist so globally-profitable   #
+    #    traders get the SNW label; topic_specialist then catches domain- #
+    #    specialists whose global CLV is more modest.                     #
+    #    min_trades lowered to 10 to account for limited ingestion window #
+    #    (global trade feed samples each trader infrequently).            #
     # ------------------------------------------------------------------ #
     if (
-        profile.gamma_score > 0.05          # meaningful topic-level CLV edge
-        and profile.total_trades >= 5       # enough data
-        and profile.directional_purity > 0.4  # not a MM
+        profile.avg_clv >= 0.05
+        and profile.directional_purity >= 0.60
+        and 10 <= profile.total_trades < 500
+    ):
+        return (
+            "serious_non_whale",
+            0.80,
+            f"Globally consistent CLV ({profile.avg_clv:.4f}) on {profile.total_trades} trades, "
+            f"purity {profile.directional_purity:.2f} — consistent early-entry advantage.",
+        )
+
+    # ------------------------------------------------------------------ #
+    # 3. Topic Specialist – domain-specific edge (research Section 5)      #
+    #    High gamma_score = above-average CLV in a specific topic cluster  #
+    #    even when global avg_clv is modest.                               #
+    # ------------------------------------------------------------------ #
+    if (
+        profile.gamma_score > 0.12
+        and profile.total_trades >= 5
+        and profile.directional_purity > 0.50
+        and profile.avg_clv > 0.02
     ):
         return (
             "topic_specialist",
             0.75,
-            f"High topic-specific gamma score ({profile.gamma_score:.3f}) indicates "
-            f"domain edge (directional purity {profile.directional_purity:.2f}).",
+            f"High topic-specific gamma score ({profile.gamma_score:.3f}) with "
+            f"domain edge (purity {profile.directional_purity:.2f}).",
         )
 
     # ------------------------------------------------------------------ #
-    # 3. Whale – large notional exposure + directional conviction          #
-    #    Note: profit_loss stored as total notional (proxy until we have   #
-    #    realized PnL).  Threshold set conservatively.                     #
+    # 4. Whale – large average trade size + directional conviction         #
+    #    Whales trade infrequently (1-5 big positions per market) so we   #
+    #    gate on average trade size, not cumulative count.                 #
+    #    $2 000+ avg notional per trade = whale-tier position sizing.      #
+    #    CLV gate is lenient (> -0.20) — a large committed bet is the     #
+    #    signal even when short-term CLV hasn't fully resolved.            #
     # ------------------------------------------------------------------ #
-    # Docs: trade_count >= 50, purity >= 0.70, mean_clv >= 0.05
-    # avg_clv gate added to prevent high-notional market-makers from being mislabelled.
+    _avg_notional = profile.profit_loss / max(1, profile.total_trades)
     if (
-        profile.profit_loss > 10_000
-        and profile.directional_purity >= 0.70
-        and profile.avg_clv >= 0.05
-        and profile.total_trades >= 30
+        _avg_notional > 2_000
+        and profile.directional_purity >= 0.65
+        and profile.avg_clv > -0.20
     ):
         return (
             "whale",
             0.85,
-            f"Large notional ({profile.profit_loss:.0f}) with strong directional "
-            f"conviction ({profile.directional_purity:.2f}) and CLV ({profile.avg_clv:.4f}).",
-        )
-
-    # ------------------------------------------------------------------ #
-    # 4. Serious Non-Whale (SNW) – research shows these are often the      #
-    #    BEST signal: high CLV (price moved their way after entry) on a    #
-    #    moderate but meaningful trade count.                              #
-    # ------------------------------------------------------------------ #
-    # Docs: trade_count >= 20, purity >= 0.60, mean_clv >= 0.03
-    if (
-        profile.avg_clv >= 0.03
-        and profile.directional_purity >= 0.50
-        and 10 <= profile.total_trades < 200
-    ):
-        return (
-            "serious_non_whale",
-            0.70,
-            f"Positive avg CLV ({profile.avg_clv:.4f}) on {profile.total_trades} trades, "
-            f"purity {profile.directional_purity:.2f} — consistent early entry advantage.",
+            f"Large avg notional ({_avg_notional:.0f}/trade) with directional "
+            f"conviction ({profile.directional_purity:.2f}). CLV={profile.avg_clv:.4f}.",
         )
 
     # ------------------------------------------------------------------ #

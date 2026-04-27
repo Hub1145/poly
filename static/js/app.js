@@ -106,13 +106,15 @@ document.addEventListener('DOMContentLoaded', () => {
             try {
                 const cfg = data.config || {};
                 const inputs = {
-                    's-mode':       (cfg.paper_mode ?? true).toString(),
-                    's-strategy':   cfg.strategy     ?? '',
-                    's-amount':     cfg.trade_amount ?? '',
-                    's-edge':       cfg.min_edge      ?? '',
-                    's-interval':   cfg.scan_interval ?? '',
-                    's-balance':    cfg.paper_balance ?? '',
-                    's-max-trades': cfg.max_trades    ?? '',
+                    's-mode':        (cfg.paper_mode ?? true).toString(),
+                    's-strategy':    cfg.strategy     ?? '',
+                    's-amount':      cfg.trade_amount ?? '',
+                    's-edge':        cfg.min_edge      ?? '',
+                    's-interval':    cfg.scan_interval ?? '',
+                    's-balance':     cfg.paper_balance ?? '',
+                    's-max-trades':  cfg.max_trades    ?? '',
+                    's-take-profit': cfg.take_profit   ?? 50,
+                    's-stop-loss':   cfg.stop_loss     ?? 30,
                 };
                 for (const [id, val] of Object.entries(inputs)) {
                     const el = document.getElementById(id);
@@ -130,15 +132,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
         // ── Open Positions ───────────────────────────────────────────────
         try {
-            positionsTable.innerHTML = (data.open_positions || []).map(p => `
+            positionsTable.innerHTML = (data.open_positions || []).map(p => {
+                const unreal = p.unrealized || 0;
+                const unrCls = unreal >= 0 ? 'success' : 'danger';
+                return `
                 <tr>
                     <td title="${p.market}">${(p.market || '').substring(0, 50)}...</td>
                     <td><span class="side-badge ${(p.side || '').toLowerCase()}">${p.side || ''}</span></td>
-                    <td>$${p.size || 0}</td>
+                    <td>$${(p.size || 0).toFixed(2)} <small style="color:var(--text-dim)">(${p.shares || 0} shares)</small></td>
                     <td>${(p.price || 0).toFixed(3)}</td>
+                    <td class="${unrCls}">${unreal >= 0 ? '+' : ''}$${unreal.toFixed(2)}</td>
                     <td><span class="success">${p.signal_type || 'Bayesian'}</span></td>
-                </tr>
-            `).join('');
+                </tr>`;
+            }).join('');
         } catch (_) {}
 
         // ── Resolved Positions ───────────────────────────────────────────
@@ -240,6 +246,23 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         } catch (_) {}
 
+            // ── Alpha Feed tab visibility (trader strategies only) ───────────
+        try {
+            const TRADER_STRATEGIES = new Set([
+                'bayesian_ensemble', 'conservative_snw', 'aggressive_whale', 'specialist_precision'
+            ]);
+            const activeStrategy = (data.config || {}).strategy || '';
+            const isTraderStrategy = TRADER_STRATEGIES.has(activeStrategy);
+            const newsTabBtn = document.querySelector('.tab-btn[data-tab="news"]');
+            if (newsTabBtn) {
+                newsTabBtn.style.display = isTraderStrategy ? '' : 'none';
+                // If user is on the hidden tab, redirect to dashboard
+                if (!isTraderStrategy && sessionStorage.getItem('activeTab') === 'news') {
+                    switchTab('dashboard');
+                }
+            }
+        } catch (_) {}
+
         // ── Alpha Feed ───────────────────────────────────────────────────
         try {
             newsTable.innerHTML = (data.news_events || []).map(e => `
@@ -329,6 +352,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 scan_interval: parseInt(document.getElementById('s-interval').value),
                 paper_balance: parseFloat(document.getElementById('s-balance').value),
                 max_trades:    parseInt(document.getElementById('s-max-trades').value),
+                take_profit:   parseFloat(document.getElementById('s-take-profit').value),
+                stop_loss:     parseFloat(document.getElementById('s-stop-loss').value),
             };
             // Only include private_key if the user actually typed something
             if (pk.trim()) config.private_key = pk.trim();
@@ -355,13 +380,15 @@ document.addEventListener('DOMContentLoaded', () => {
         .then(cfg => {
             // Populate editable settings from saved config
             const inputs = {
-                's-mode':       (cfg.paper_mode ?? true).toString(),
-                's-strategy':   cfg.strategy     ?? '',
-                's-amount':     cfg.trade_amount  ?? '',
-                's-edge':       cfg.min_edge       ?? '',
-                's-interval':   cfg.scan_interval  ?? '',
-                's-balance':    cfg.paper_balance  ?? '',
-                's-max-trades': cfg.max_trades     ?? '',
+                's-mode':        (cfg.paper_mode ?? true).toString(),
+                's-strategy':    cfg.strategy     ?? '',
+                's-amount':      cfg.trade_amount  ?? '',
+                's-edge':        cfg.min_edge       ?? '',
+                's-interval':    cfg.scan_interval  ?? '',
+                's-balance':     cfg.paper_balance  ?? '',
+                's-max-trades':  cfg.max_trades     ?? '',
+                's-take-profit': cfg.take_profit    ?? 50,
+                's-stop-loss':   cfg.stop_loss      ?? 30,
             };
             for (const [id, val] of Object.entries(inputs)) {
                 const el = document.getElementById(id);

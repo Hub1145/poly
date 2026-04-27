@@ -2,12 +2,15 @@ import json
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 
 from packages.db.database import get_db
 from packages.core.config import settings
 from packages.scoring.market_aggregation import aggregate_market_signals
-from packages.scoring.strategies.weather_probability import precompute_temperature_bucket_winners
+from packages.scoring.strategies.weather_probability import (
+    precompute_temperature_bucket_winners,
+    precompute_precipitation_bucket_winners,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -15,26 +18,56 @@ _STRATEGY_TAG_FILTER = {
     "laddering":          {"Weather"},
     "weather_prediction": {"Weather"},
     "disaster":           {"Natural Disasters"},
-    "seismic":            {"Earthquakes", "Natural Disasters"},
     "no_bias":            {"Politics", "Pop Culture", "Entertainment", "Business"},
 }
 
 _STRATEGY_KEYWORDS = {
-    "laddering":          ["temperature", "heat", "cold", "degrees", "highest", "lowest"],
-    "weather_prediction": ["temperature", "heat", "cold", "degrees", "highest", "lowest"],
-    "disaster":           ["hurricane", "cyclone", "typhoon", "flood", "wildfire", "blizzard", "avalanche", "landslide", "tsunami"],
-    "seismic":            ["earthquake", "magnitude", "seismic", "richter", "tsunami"],
+    # Temperature keywords for city-level daily forecast markets.
+    # "highest temperature" / "daily high" / "degrees" / degree-symbol forms all
+    # match standard Polymarket temperature bucket phrasing.
+    "laddering":          ["highest temperature", "daily high temperature",
+                           "degrees fahrenheit", "degrees celsius",
+                           "daily high", "°f", "°c",
+                           "precipitation", "rainfall", "inches of rain", "mm of rain"],
+    "weather_prediction": ["highest temperature", "daily high temperature",
+                           "degrees fahrenheit", "degrees celsius",
+                           "daily high", "°f", "°c",
+                           "precipitation", "rainfall", "inches of rain", "mm of rain"],
+    # Disaster + Seismic (merged): broad natural-event terms covering weather disasters
+    # and geological events.  Sports-team names (Hurricanes, Avalanche, Earthquakes, etc.)
+    # are stripped by _STRATEGY_EXCLUDE_PATTERNS below.
+    "disaster":           ["hurricane", "tornado", "tropical storm", "cyclone", "typhoon",
+                           "flood", "wildfire", "blizzard", "landslide", "tsunami",
+                           "volcanic eruption", "eruption", "named storm", "natural disaster",
+                           "drought", "heatwave", "heat wave",
+                           # seismic terms (merged)
+                           "earthquake of magnitude", "earthquakes of magnitude",
+                           "magnitude 6", "magnitude 7", "magnitude 8", "magnitude 9",
+                           "seismic", "richter", "aftershock"],
 }
 
-# Strategies that are scored purely from trader DB data (no external API calls)
-_TRADER_STRATEGIES = frozenset({
-    "bayesian_ensemble", "conservative_snw", "aggressive_whale",
-    "specialist_precision", "long_range", "volatility",
-})
-_PRICE_ZONE_STRATEGIES = frozenset({"no_bias", "black_swan"})
-_EXTERNAL_STRATEGIES   = frozenset({"laddering", "disaster", "seismic", "weather_prediction"})
+# SQL LIKE exclusion patterns applied AFTER the keyword match.
+# Strips out sports/entertainment contexts that share vocabulary with weather/seismic.
+_STRATEGY_EXCLUDE_PATTERNS: Dict[str, list] = {
+    # Disaster (incl. seismic): strip sports teams and non-event contexts
+    "disaster": ["%nhl%", "%nba%", "%nfl%", "%mls%", "%mlb%",
+                 "% stanley cup%", "%playoffs%", "%championship%",
+                 "%solar storm%", "%geomagnetic%",
+                 "%hurricanes win%", "%hurricanes lose%", "%hurricanes beat%",
+                 "%avalanche win%", "%avalanche lose%", "%flood of%",
+                 "%earthquakes win%", "%earthquakes lose%", "%earthquakes beat%"],
+}
 
-# Scoring constants (must match market_aggregation.py)
+# Strategies that use skilled-trader data (whale / SNW / topic-specialist trades)
+_TRADER_STRATEGIES = frozenset({
+    "bayesian_ensemble", "conservative_snw", "aggressive_whale", "specialist_precision",
+})
+# Price-structure strategies — no trader data, no external API
+_PRICE_ZONE_STRATEGIES = frozenset({"no_bias", "black_swan", "long_range", "volatility"})
+# External-data strategies — weather / seismic APIs
+_EXTERNAL_STRATEGIES   = frozenset({"laddering", "disaster", "weather_prediction"})
+
+# Scoring constants for the trader bulk scorer
 _COEFF_GLOBAL_SKILL = 0.30
 _COEFF_CONVERGENCE  = 0.25
 _COEFF_EARLY_ENTRY  = 0.10
@@ -47,17 +80,19 @@ _BASE_WEIGHTS: Dict[str, float] = {
 }
 
 _MIN_STRENGTH: Dict[str, float] = {
+    # Trader strategies
     "bayesian_ensemble":    1.0,
     "conservative_snw":     1.5,
     "aggressive_whale":     0.8,
     "specialist_precision": 1.0,
+    # Price-structure strategies
     "no_bias":              0.8,
     "black_swan":           0.5,
-    "long_range":           1.0,
-    "volatility":           0.8,
+    "long_range":           0.4,
+    "volatility":           0.3,
+    # External strategies
     "laddering":            0.35,
     "disaster":             0.35,
-    "seismic":              0.25,
 }
 
 _MIN_TRADERS: Dict[str, int] = {
@@ -65,8 +100,6 @@ _MIN_TRADERS: Dict[str, int] = {
     "conservative_snw":     1,
     "aggressive_whale":     1,
     "specialist_precision": 1,
-    "long_range":           1,
-    "volatility":           1,
 }
 
 _STRATEGY_LABEL_FILTERS: Dict[str, tuple] = {
@@ -74,8 +107,6 @@ _STRATEGY_LABEL_FILTERS: Dict[str, tuple] = {
     "conservative_snw":     ("serious_non_whale",),
     "aggressive_whale":     ("whale",),
     "specialist_precision": ("whale", "serious_non_whale", "topic_specialist"),
-    "long_range":           ("whale", "serious_non_whale", "topic_specialist"),
-    "volatility":           ("whale",),
 }
 
 
@@ -99,21 +130,13 @@ async def _get_markets_for_strategy(strategy: str) -> list:
     else:
         market_ids: set = set()
 
-        if tag_labels:
-            placeholders = ",".join("?" * len(tag_labels))
-            tag_ids = await db.fetchall(
-                f"""
-                SELECT DISTINCT m.id FROM markets m
-                JOIN market_tags mt ON mt.market_id = m.id
-                WHERE m.active=1 AND m.closed=0
-                  AND (LOWER(m.market_type) IN ('binary','') OR m.market_type IS NULL)
-                  AND LOWER(mt.tag) IN ({placeholders})
-                """,
-                tuple(t.lower() for t in tag_labels),
-            )
-            market_ids.update(r["id"] for r in tag_ids)
-
         if keywords:
+            # Keywords are more precise than Polymarket's noisy tagging.
+            # When keywords are defined, use keywords ONLY — tags are used only
+            # as a fallback when no keyword list exists for the strategy.
+            # (Reason: Polymarket applies the "Weather" tag to volcanoes/hurricanes,
+            # "Natural Disasters" to earthquakes, etc., making tag-only matches
+            # return hundreds of irrelevant markets.)
             kw_clauses = " OR ".join(
                 "LOWER(question) LIKE ?" for _ in keywords
             )
@@ -127,15 +150,42 @@ async def _get_markets_for_strategy(strategy: str) -> list:
                 tuple(f"%{kw}%" for kw in keywords),
             )
             market_ids.update(r["id"] for r in kw_ids)
+        elif tag_labels:
+            # Tag-only path: used for strategies that have no keyword list.
+            # For no_bias, the tag filter scopes to politics/pop-culture topics.
+            placeholders = ",".join("?" * len(tag_labels))
+            tag_ids = await db.fetchall(
+                f"""
+                SELECT DISTINCT m.id FROM markets m
+                JOIN market_tags mt ON mt.market_id = m.id
+                WHERE m.active=1 AND m.closed=0
+                  AND (LOWER(m.market_type) IN ('binary','') OR m.market_type IS NULL)
+                  AND LOWER(mt.tag) IN ({placeholders})
+                """,
+                tuple(t.lower() for t in tag_labels),
+            )
+            market_ids.update(r["id"] for r in tag_ids)
 
         if not market_ids:
             return []
 
         placeholders = ",".join("?" * len(market_ids))
-        markets = await db.fetchall(
-            f"SELECT * FROM markets WHERE id IN ({placeholders})",
-            tuple(market_ids),
-        )
+
+        # Apply exclusion patterns (e.g. strip sports teams matching weather/seismic keywords)
+        exclude_patterns = _STRATEGY_EXCLUDE_PATTERNS.get(strategy, [])
+        if exclude_patterns:
+            excl_clauses = " AND ".join(
+                "LOWER(question) NOT LIKE ?" for _ in exclude_patterns
+            )
+            markets = await db.fetchall(
+                f"SELECT * FROM markets WHERE id IN ({placeholders}) AND {excl_clauses}",
+                tuple(market_ids) + tuple(exclude_patterns),
+            )
+        else:
+            markets = await db.fetchall(
+                f"SELECT * FROM markets WHERE id IN ({placeholders})",
+                tuple(market_ids),
+            )
 
     return [
         m for m in markets
@@ -193,6 +243,23 @@ async def _bulk_score_trader_markets(
         """,
         tuple(market_ids) + label_filters,
     )
+
+    # Bulk fetch YES and NO outcome_ids for all markets (needed for signal INSERT)
+    outcome_rows = await db.fetchall(
+        f"""
+        SELECT market_id, id, LOWER(name) AS name
+        FROM outcomes
+        WHERE market_id IN ({id_ph}) AND LOWER(name) IN ('yes', 'no')
+        """,
+        tuple(market_ids),
+    )
+    yes_oids: Dict[str, int] = {}
+    no_oids:  Dict[str, int] = {}
+    for r in outcome_rows:
+        if r["name"] == "yes":
+            yes_oids[r["market_id"]] = r["id"]
+        else:
+            no_oids[r["market_id"]] = r["id"]
 
     # Group trades by market
     trades_by_market: Dict[str, list] = defaultdict(list)
@@ -253,12 +320,22 @@ async def _bulk_score_trader_markets(
                 no_conviction += size_norm + early_bonus * 0.5
                 no_traders.add(r["trader_address"])
 
-        yes_score = (_COEFF_GLOBAL_SKILL * yes_global
-                     + _COEFF_CONVERGENCE * len(yes_traders)
-                     + (_COEFF_EARLY_ENTRY + _COEFF_CONVICTION) * yes_conviction)
-        no_score  = (_COEFF_GLOBAL_SKILL * no_global
-                     + _COEFF_CONVERGENCE * len(no_traders)
-                     + (_COEFF_EARLY_ENTRY + _COEFF_CONVICTION) * no_conviction)
+        if strategy == "long_range":
+            yes_score = (_COEFF_GLOBAL_SKILL * yes_global
+                         + 0.45 * yes_conviction
+                         + 0.35 * len(yes_traders)
+                         + _COEFF_EARLY_ENTRY * yes_conviction)
+            no_score  = (_COEFF_GLOBAL_SKILL * no_global
+                         + 0.45 * no_conviction
+                         + 0.35 * len(no_traders)
+                         + _COEFF_EARLY_ENTRY * no_conviction)
+        else:
+            yes_score = (_COEFF_GLOBAL_SKILL * yes_global
+                         + _COEFF_CONVERGENCE * len(yes_traders)
+                         + (_COEFF_EARLY_ENTRY + _COEFF_CONVICTION) * yes_conviction)
+            no_score  = (_COEFF_GLOBAL_SKILL * no_global
+                         + _COEFF_CONVERGENCE * len(no_traders)
+                         + (_COEFF_EARLY_ENTRY + _COEFF_CONVICTION) * no_conviction)
 
         bias            = "YES" if yes_score >= no_score else "NO"
         strength        = round(abs(yes_score - no_score), 4)
@@ -276,9 +353,13 @@ async def _bulk_score_trader_markets(
         if strength < min_strength:
             continue
 
+        outcome_id = yes_oids.get(mid) if bias == "YES" else no_oids.get(mid)
+        if outcome_id is None:
+            continue  # no outcome row — cannot record a tradeable signal
+
         signals.append({
             "market_id":        mid,
-            "outcome_id":       None,
+            "outcome_id":       outcome_id,
             "signal_type":      strategy,
             "signal_strength":  strength,
             "directional_bias": bias,
@@ -297,16 +378,36 @@ async def _bulk_score_price_zone_markets(
     db, markets: list, strategy: str, now: datetime
 ) -> List[Dict[str, Any]]:
     """
-    Score no_bias / black_swan using a single bulk YES-price query.
+    Score price-structure strategies (no_bias, black_swan, long_range, volatility)
+    using bulk price queries only — no skilled-trader data.
     """
     market_ids = [m.id for m in markets]
     if not market_ids:
         return []
 
     ph = ",".join("?" * len(market_ids))
+
+    # Bulk fetch outcome_ids for both YES and NO sides
+    oid_rows = await db.fetchall(
+        f"""
+        SELECT market_id, id, LOWER(name) AS name
+        FROM outcomes
+        WHERE market_id IN ({ph}) AND LOWER(name) IN ('yes', 'no')
+        """,
+        tuple(market_ids),
+    )
+    _yes_oids: Dict[str, int] = {}
+    _no_oids:  Dict[str, int] = {}
+    for r in oid_rows:
+        if r["name"] == "yes":
+            _yes_oids[r["market_id"]] = r["id"]
+        else:
+            _no_oids[r["market_id"]] = r["id"]
+
+    # Bulk fetch latest YES price AND bid/ask spread for each market
     price_rows = await db.fetchall(
         f"""
-        SELECT ps.market_id, ps.mid_price
+        SELECT ps.market_id, ps.mid_price, ps.best_bid, ps.best_ask
         FROM price_snapshots ps
         JOIN outcomes o ON ps.outcome_id = o.id
         WHERE ps.market_id IN ({ph})
@@ -321,46 +422,121 @@ async def _bulk_score_price_zone_markets(
         """,
         tuple(market_ids),
     )
-    yes_prices = {r["market_id"]: float(r["mid_price"]) for r in price_rows}
+    price_data: Dict[str, dict] = {
+        r["market_id"]: {
+            "mid":  float(r["mid_price"]),
+            "bid":  float(r["best_bid"]),
+            "ask":  float(r["best_ask"]),
+        }
+        for r in price_rows
+    }
+
+    # For long_range: pre-filter to markets with 30+ days remaining
+    long_range_valid: set = set()
+    if strategy == "long_range":
+        end_rows = await db.fetchall(
+            f"SELECT id, end_date_iso, question FROM markets WHERE id IN ({ph})",
+            tuple(market_ids),
+        )
+        for r in end_rows:
+            ed_raw = r["end_date_iso"]
+            ed: Optional[datetime] = None
+            if ed_raw is not None:
+                if isinstance(ed_raw, datetime):
+                    ed = ed_raw
+                else:
+                    try:
+                        ed = datetime.fromisoformat(str(ed_raw).split(".")[0])
+                    except ValueError:
+                        ed = None
+            if ed is None:
+                # Fall back to parsing date from question text
+                from packages.scoring.market_aggregation import _parse_end_date_from_question
+                mq = r["question"] or ""
+                if mq:
+                    ed = _parse_end_date_from_question(mq)
+            if ed is not None and (ed - now).days >= 30:
+                long_range_valid.add(r["id"])
 
     now_str      = now.strftime("%Y-%m-%d %H:%M:%S")
     min_strength = _MIN_STRENGTH.get(strategy, 0.5)
     signals: List[Dict[str, Any]] = []
 
     for market in markets:
-        mid       = market.id
-        yes_price = yes_prices.get(mid)
-        if yes_price is None:
+        mid   = market.id
+        pdata = price_data.get(mid)
+        if pdata is None:
             continue
+        yes_price = pdata["mid"]
 
+        # ── no_bias: bet NO against retail YES overpricing ────────────────
         if strategy == "no_bias":
             if not (0.20 <= yes_price <= 0.50):
                 continue
-            strength = round(1.5 + (0.50 - yes_price) * 2.0, 4)
-            if strength < min_strength:
-                continue
-            signals.append({
-                "market_id": mid, "outcome_id": None,
-                "signal_type": "no_bias", "signal_strength": strength,
-                "directional_bias": "NO",
-                "explanation": f"[No-Bias] Retail overbuy zone: YES={yes_price:.3f}",
-                "top_traders": "[]", "created_at": now_str,
-            })
+            strength   = round(1.5 + (0.50 - yes_price) * 2.0, 4)
+            bias       = "NO"
+            outcome_id = _no_oids.get(mid)
+            reason     = f"[No-Bias] Retail YES overpricing: YES={yes_price:.3f}"
 
+        # ── black_swan: deep tail YES floor ──────────────────────────────
         elif strategy == "black_swan":
             if not (0.005 <= yes_price <= 0.05):
                 continue
-            tail_factor = 1.0 + (0.05 - yes_price) / 0.045 * 1.5
-            strength    = min(2.5, round(tail_factor, 4))
-            if strength < min_strength:
+            strength   = min(2.5, round(1.0 + (0.05 - yes_price) / 0.045 * 1.5, 4))
+            bias       = "YES"
+            outcome_id = _yes_oids.get(mid)
+            reason     = f"[Black Swan] Deep tail YES floor: {yes_price:.3f}"
+
+        # ── long_range: price-structure edge in 30+ day markets ──────────
+        elif strategy == "long_range":
+            if mid not in long_range_valid:
                 continue
-            signals.append({
-                "market_id": mid, "outcome_id": None,
-                "signal_type": "black_swan", "signal_strength": strength,
-                "directional_bias": "YES",
-                "explanation": f"[Black Swan] Deep tail, floor: YES={yes_price:.3f}",
-                "top_traders": "[]", "created_at": now_str,
-            })
+            if 0.15 <= yes_price <= 0.42:
+                # Underpriced long-dated uncertainty → YES
+                strength   = round((0.42 - yes_price) / 0.27 * 1.2 + 0.3, 4)
+                bias       = "YES"
+                outcome_id = _yes_oids.get(mid)
+                reason     = f"[Long-Range] Underpriced YES on 30d+ market: {yes_price:.3f}"
+            elif 0.58 <= yes_price <= 0.85:
+                # Overpriced long-dated event → NO
+                strength   = round((yes_price - 0.58) / 0.27 * 1.2 + 0.3, 4)
+                bias       = "NO"
+                outcome_id = _no_oids.get(mid)
+                reason     = f"[Long-Range] Overpriced YES on 30d+ market: {yes_price:.3f}"
+            else:
+                continue
+
+        # ── volatility: wide bid-ask spread = high market disagreement ───
+        elif strategy == "volatility":
+            spread = pdata["ask"] - pdata["bid"]
+            if spread < 0.06 or not (0.25 <= yes_price <= 0.75):
+                continue
+            # Trade toward cheaper side of the spread
+            if yes_price <= 0.50:
+                bias       = "YES"
+                outcome_id = _yes_oids.get(mid)
+            else:
+                bias       = "NO"
+                outcome_id = _no_oids.get(mid)
+            strength = round(spread * 6.0, 4)   # 0.06 spread→0.36, 0.20 spread→1.2
+            reason   = f"[Volatility] Wide spread {spread:.3f} — {bias} at {yes_price:.3f}"
+
+        else:
+            continue
+
+        if strength < min_strength or outcome_id is None:
+            continue
+
+        signals.append({
+            "market_id":        mid,
+            "outcome_id":       outcome_id,
+            "signal_type":      strategy,
+            "signal_strength":  strength,
+            "directional_bias": bias,
+            "explanation":      reason,
+            "top_traders":      "[]",
+            "created_at":       now_str,
+        })
 
     return signals
 
@@ -403,7 +579,10 @@ async def refresh_market_signals() -> int:
     # ── External strategies: per-market loop (must hit weather/seismic APIs) ─
     else:
         if strategy in ("weather_prediction", "laddering"):
+            # Precompute winners for both temperature and precipitation bucket groups
+            # before the scoring loop so mutual-exclusivity logic has the data it needs.
             await precompute_temperature_bucket_winners(markets)
+            await precompute_precipitation_bucket_winners(markets)
 
         errors = 0
         for market in markets:

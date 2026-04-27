@@ -1,5 +1,5 @@
 {
-  "strategy": "disaster",
+  "strategy": "laddering",
   "paper_mode": true,
   "trade_amount": 10,
   "min_edge": 0.2,
@@ -8,5 +8,7 @@
   "max_trades": 10,
   "polymarket": {
     "private_key": "0xdfc59bd3413294d25cdb0e1db4ff21c1efaf8c14b74b644b6abfda3cfd3bb07f"
-  }
+  },
+  "take_profit": 50,
+  "stop_loss": 30
 }

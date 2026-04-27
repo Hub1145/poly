@@ -6,7 +6,8 @@ from typing import List, Dict, Any, Optional
 
 from packages.db.database import DB
 from packages.scoring.strategies.weather_probability import (
-    compute_weather_alpha, compute_ensemble_weather_alpha,
+    compute_weather_alpha, compute_ensemble_weather_alpha, compute_ladder_weather_alpha,
+    compute_precipitation_alpha,
 )
 from packages.explanation.engine import generate_signal_explanation
 from packages.ingestion.clients.polymarket_http import ClobClient
@@ -95,21 +96,20 @@ BASE_WEIGHTS = {
 }
 
 MIN_STRENGTH = {
-    "conservative_snw":    0.8,
-    "specialist_precision": 0.6,
-    "bayesian_ensemble":   0.4,
-    "long_range":          0.4,
-    "aggressive_whale":    0.3,
-    "no_bias":             0.3,
-    "black_swan":          0.2,
-    "volatility":          0.3,
-    "laddering":            0.10,
-    "disaster":             0.10,
-    "seismic":              0.10,
+    "bayesian_ensemble":    1.0,
+    "conservative_snw":     1.5,
+    "aggressive_whale":     0.8,
+    "specialist_precision": 1.0,
+    "no_bias":              0.8,
+    "black_swan":           0.5,
+    "long_range":           1.0,
+    "volatility":           0.8,
+    "laddering":            0.35,
+    "disaster":             0.35,
     "weather_prediction":   0.10,
 }
 
-_EXTERNAL_DATA_STRATEGIES = {"laddering", "disaster", "seismic", "weather_prediction"}
+_EXTERNAL_DATA_STRATEGIES = {"laddering", "disaster", "weather_prediction"}
 _TRADER_SIGNAL_STRATEGIES = {
     "bayesian_ensemble", "conservative_snw", "aggressive_whale",
     "specialist_precision", "long_range", "volatility",
@@ -185,32 +185,110 @@ async def _build_external_signal(
     ext_narrative: str = ""
     source_label: str  = ""
 
-    # Seismic strategy disabled: no reliable forecast model for earthquake
-    # count prediction. Earthquake markets resolve post-event only.
-    # if strategy == "seismic": return None (intentional)
-
-    # weather_prediction — 40-member ICON ensemble, empirical probability
+    # weather_prediction — temperature: 40-member ensemble empirical probability
     if edge == 0.0 and strategy == "weather_prediction":
         _wx = await compute_ensemble_weather_alpha(market_q, yes_price)
         if isinstance(_wx, tuple):
             edge, ext_narrative = _wx
         source_label = "weather_prediction"
 
-    # laddering / disaster — single-model Open-Meteo forecast
-    if edge == 0.0 and strategy in ("laddering", "disaster"):
-        # disaster strategy must NOT score temperature-threshold markets —
-        # those belong to laddering/weather_prediction only.
-        _temp_kw = ("temperature", "degrees", "celsius", "fahrenheit",
-                    "heat index", "feels like", "high of", "low of",
-                    "record high", "record low")
-        _is_temp_market = any(kw in market_q.lower() for kw in _temp_kw)
-        if strategy == "disaster" and _is_temp_market:
-            pass   # skip — not a disaster market
-        else:
+    # weather_prediction — precipitation: monthly accumulation vs bucket threshold
+    if edge == 0.0 and strategy == "weather_prediction":
+        _wx = await compute_precipitation_alpha(market_q, yes_price)
+        if isinstance(_wx, tuple):
+            edge, ext_narrative = _wx
+        source_label = "weather_prediction"
+
+    # laddering — temperature: ensemble scorer with adjacent YES bucket signals
+    if edge == 0.0 and strategy == "laddering":
+        _wx = await compute_ladder_weather_alpha(market_q, yes_price)
+        if isinstance(_wx, tuple):
+            edge, ext_narrative = _wx
+        source_label = "weather_laddering"
+
+    # laddering — precipitation: same monthly accumulation scorer
+    if edge == 0.0 and strategy == "laddering":
+        _wx = await compute_precipitation_alpha(market_q, yes_price)
+        if isinstance(_wx, tuple):
+            edge, ext_narrative = _wx
+        source_label = "weather_laddering"
+
+    # disaster (merged with seismic) — routes to seismic or weather scorer by content
+    if edge == 0.0 and strategy == "disaster":
+        _seismic_kw = ("earthquake", "seismic", "magnitude", "richter", "aftershock",
+                       "volcanic eruption", "eruption")
+        _temp_kw    = ("temperature", "degrees", "celsius", "fahrenheit",
+                       "heat index", "feels like", "high of", "low of",
+                       "record high", "record low")
+        q_low = market_q.lower()
+
+        if any(kw in q_low for kw in _seismic_kw):
+            # ── Seismic sub-path: USGS NSHM base-rate + live catalog Omori boost ──
+            _REGION_RATES = {
+                "japan":         0.30, "indonesia":  0.25, "turkey":      0.22,
+                "chile":         0.20, "california": 0.18, "new zealand": 0.17,
+                "greece":        0.15, "san francisco": 0.14, "los angeles": 0.12,
+                "nepal":         0.12, "iran":       0.10, "philippines": 0.10,
+                "peru":          0.09, "alaska":     0.08,
+            }
+            _REGION_BBOX = {
+                "japan":         (30.0, 45.0, 130.0, 145.0),
+                "indonesia":     (-10.0, 5.0, 95.0, 140.0),
+                "turkey":        (36.0, 42.0, 26.0, 44.0),
+                "chile":         (-40.0, -20.0, -75.0, -65.0),
+                "california":    (32.0, 42.0, -124.0, -114.0),
+                "san francisco": (36.5, 38.5, -123.5, -121.0),
+                "los angeles":   (33.5, 34.5, -119.0, -117.5),
+                "nepal":         (26.0, 30.0, 80.0, 88.0),
+            }
+            region    = next((r for r in _REGION_RATES if r in q_low), None)
+            base_prob = _REGION_RATES.get(region, 0.04)
+            source_note = "USGS NSHM base-rate"
+            bbox = _REGION_BBOX.get(region) if region else None
+            if bbox:
+                try:
+                    from datetime import datetime as _dt, timedelta as _td
+                    import httpx as _hx
+                    _end   = _dt.utcnow()
+                    _start = _end - _td(days=30)
+                    _params = {
+                        "format": "geojson", "starttime": _start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "endtime": _end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "minmagnitude": "4.0", "minlatitude": str(bbox[0]),
+                        "maxlatitude": str(bbox[1]), "minlongitude": str(bbox[2]),
+                        "maxlongitude": str(bbox[3]), "orderby": "magnitude", "limit": "5",
+                    }
+                    async with _hx.AsyncClient(timeout=8.0) as _cl:
+                        _r = await _cl.get(
+                            "https://earthquake.usgs.gov/fdsnws/event/1/query", params=_params
+                        )
+                        if _r.status_code == 200:
+                            _evts = _r.json().get("features", [])
+                            if _evts:
+                                _mx = max(f["properties"].get("mag", 0) or 0 for f in _evts)
+                                _boost = min(0.30, (_mx - 4.0) * 0.15)
+                                base_prob = min(0.95, base_prob + _boost)
+                                source_note = (
+                                    f"USGS catalog: M{_mx:.1f} in last 30 days "
+                                    f"(Omori +{_boost*100:.0f}%) + NSHM base"
+                                )
+                            else:
+                                source_note = "USGS catalog: no M4+ in last 30 days + NSHM base"
+                except Exception as _se:
+                    logger.debug(f"[Seismic] USGS catalog fetch failed: {_se}")
+            edge = round(base_prob - yes_price, 4)
+            ext_narrative = (
+                f"[Seismic] Region '{region or 'global'}' | {source_note} "
+                f"{base_prob*100:.1f}% vs market {yes_price*100:.1f}%. Edge: {edge:+.3f}."
+            )
+            source_label = "seismic"
+
+        elif not any(kw in q_low for kw in _temp_kw):
+            # ── Weather/disaster sub-path: Open-Meteo wind/precipitation ──
             _wx = await compute_weather_alpha(market_q, "YES", yes_price)
             if isinstance(_wx, tuple):
                 edge, ext_narrative = _wx
-            source_label = "weather"
+            source_label = "weather_disaster"
 
     if edge == 0.0:
         return None
@@ -223,14 +301,14 @@ async def _build_external_signal(
 
     _TYPE_MAP = {
         "laddering":          "weather_laddering",
-        "disaster":           "weather_disaster",
-        "seismic":            "seismic",
         "weather_prediction": "weather_prediction",
     }
+    # disaster maps to either "seismic" or "weather_disaster" depending on source_label
+    sig_type = _TYPE_MAP.get(strategy, source_label if source_label else f"{strategy}_signal")
     return SignalResult(
         market_id=market_id,
         outcome_id=outcome_id,
-        signal_type=_TYPE_MAP.get(strategy, f"{source_label}_signal"),
+        signal_type=sig_type,
         directional_bias=bias,
         signal_strength=signal_strength,
         explanation=f"{ext_narrative} (Strategy: {strategy})",
@@ -302,50 +380,126 @@ async def aggregate_market_signals(
         )
         return ext_sig  # None if no signal — never fall through to trader data
 
-    # ── 0c. long_range: only act on markets with 30+ days remaining ──────────
+    # ── 0c. black_swan — price-structure only, no trader data ─────────────────
+    if strategy == "black_swan":
+        yes_price = await _get_yes_price(db, market_id)
+        if yes_price is None or not (0.005 <= yes_price <= 0.05):
+            return None
+        outcome_id = await _get_yes_outcome_id(db, market_id)
+        if outcome_id is None:
+            return None
+        strength = min(2.5, round(1.0 + (0.05 - yes_price) / 0.045 * 1.5, 4))
+        if strength < MIN_STRENGTH.get(strategy, 0.5):
+            return None
+        return SignalResult(
+            market_id=market_id,
+            outcome_id=outcome_id,
+            signal_type="black_swan",
+            directional_bias="YES",
+            signal_strength=strength,
+            explanation=f"[Black Swan] Deep tail YES floor: YES={yes_price:.3f}. Strength={strength:.2f}",
+            top_traders=[],
+            created_at=cutoff_time or datetime.utcnow(),
+        )
+
+    # ── 0d. long_range — price-structure on 30+ day markets, no trader data ───
     if strategy == "long_range":
-        now_utc = cutoff_time or datetime.utcnow()
+        now_utc  = cutoff_time or datetime.utcnow()
         end_date = await db.fetchval(
             "SELECT end_date_iso FROM markets WHERE id=?", (market_id,)
         )
-
         resolved_end: Optional[datetime] = None
-
-        # 1. Stored end_date (most reliable)
         if end_date is not None:
             resolved_end = end_date if isinstance(end_date, datetime) else (
                 datetime.fromisoformat(str(end_date).split(".")[0])
             )
-
-        # 2. Parse from question text
         if resolved_end is None and market_question:
             resolved_end = _parse_end_date_from_question(market_question)
-
         if resolved_end is None:
             mq = await db.fetchval("SELECT question FROM markets WHERE id=?", (market_id,))
             if mq:
                 resolved_end = _parse_end_date_from_question(mq)
+        if resolved_end is None or (resolved_end - now_utc).days < 30:
+            return None
 
-        # 3. Price snapshot activity window — last snapshot timestamp as proxy
-        if resolved_end is None:
-            last_snap = await db.fetchval(
-                "SELECT MAX(timestamp) FROM price_snapshots WHERE market_id=?",
+        yes_price = await _get_yes_price(db, market_id)
+        if yes_price is None:
+            return None
+
+        if 0.15 <= yes_price <= 0.42:
+            bias       = "YES"
+            outcome_id = await _get_yes_outcome_id(db, market_id)
+            strength   = round((0.42 - yes_price) / 0.27 * 1.2 + 0.3, 4)
+            narrative  = f"Underpriced YES on 30d+ market: {yes_price:.3f}"
+        elif 0.58 <= yes_price <= 0.85:
+            bias       = "NO"
+            outcome_id = await db.fetchval(
+                "SELECT id FROM outcomes WHERE market_id=? AND LOWER(name)='no' LIMIT 1",
                 (market_id,),
             )
-            if last_snap is not None:
-                last_snap_dt = last_snap if isinstance(last_snap, datetime) else (
-                    datetime.fromisoformat(str(last_snap).split(".")[0])
-                )
-                if (last_snap_dt - now_utc).days >= 30:
-                    resolved_end = last_snap_dt
-
-        # All sources exhausted — cannot confirm horizon
-        if resolved_end is None:
-            return None
-        if (resolved_end - now_utc).days < 30:
+            strength   = round((yes_price - 0.58) / 0.27 * 1.2 + 0.3, 4)
+            narrative  = f"Overpriced YES on 30d+ market: {yes_price:.3f}"
+        else:
             return None
 
-    # ── 1. Fetch skilled-trader trades ────────────────────────────────────────
+        if outcome_id is None or strength < MIN_STRENGTH.get(strategy, 0.4):
+            return None
+        return SignalResult(
+            market_id=market_id,
+            outcome_id=outcome_id,
+            signal_type="long_range",
+            directional_bias=bias,
+            signal_strength=strength,
+            explanation=f"[Long-Range] {narrative}. Strength={strength:.2f}",
+            top_traders=[],
+            created_at=now_utc,
+        )
+
+    # ── 0e. volatility — bid-ask spread signal, no trader data ───────────────
+    if strategy == "volatility":
+        snap = await db.fetchone(
+            """
+            SELECT ps.best_bid, ps.best_ask, ps.mid_price
+            FROM price_snapshots ps
+            JOIN outcomes o ON ps.outcome_id = o.id
+            WHERE ps.market_id=? AND LOWER(o.name)='yes'
+            ORDER BY ps.rowid DESC LIMIT 1
+            """,
+            (market_id,),
+        )
+        if snap is None:
+            return None
+        spread    = float(snap["best_ask"] or 0) - float(snap["best_bid"] or 0)
+        yes_price = float(snap["mid_price"] or 0.5)
+        if spread < 0.06 or not (0.25 <= yes_price <= 0.75):
+            return None
+        if yes_price <= 0.50:
+            bias       = "YES"
+            outcome_id = await _get_yes_outcome_id(db, market_id)
+        else:
+            bias       = "NO"
+            outcome_id = await db.fetchval(
+                "SELECT id FROM outcomes WHERE market_id=? AND LOWER(name)='no' LIMIT 1",
+                (market_id,),
+            )
+        strength = round(spread * 6.0, 4)
+        if outcome_id is None or strength < MIN_STRENGTH.get(strategy, 0.3):
+            return None
+        return SignalResult(
+            market_id=market_id,
+            outcome_id=outcome_id,
+            signal_type="volatility",
+            directional_bias=bias,
+            signal_strength=strength,
+            explanation=(
+                f"[Volatility] Wide bid-ask spread {spread:.3f} — "
+                f"{bias} at YES={yes_price:.3f}. Strength={strength:.2f}"
+            ),
+            top_traders=[],
+            created_at=cutoff_time or datetime.utcnow(),
+        )
+
+    # ── 1. Fetch skilled-trader trades (trader strategies only below here) ─────
     ts_filter = ""
     ts_params: tuple = ()
     if cutoff_time:
@@ -419,9 +573,6 @@ async def aggregate_market_signals(
         filtered = [r for r in results
                     if (r.gamma_score or 0) > 0.5
                     or r.label in ("serious_non_whale", "topic_specialist")]
-    elif strategy == "seismic":
-        filtered = [r for r in results
-                    if r.label in ("serious_non_whale", "topic_specialist", "whale")]
     else:
         filtered = list(results)
 
@@ -631,7 +782,6 @@ async def aggregate_market_signals(
         "bayesian_ensemble":   "bayesian_ensemble",
         "laddering":           "weather_laddering",
         "disaster":            "weather_disaster",
-        "seismic":             "seismic",
         "weather_prediction":  "weather_prediction",
     }
 

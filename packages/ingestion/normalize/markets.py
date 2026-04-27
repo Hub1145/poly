@@ -35,6 +35,25 @@ def normalize_gamma_event(
     all_prices: List[Dict[str, Any]] = []
 
     for raw_market in raw_event.get("markets", []):
+        # Gamma API uses endDateIso (date-only) or endDate (datetime) —
+        # normalize to a datetime so the DB column is consistently populated.
+        _raw_end = (
+            raw_market.get("endDateIso")
+            or raw_market.get("endDate")
+            or raw_market.get("end_date_iso")
+        )
+        if _raw_end:
+            _raw_end = str(_raw_end).replace("Z", "+00:00")
+            try:
+                _end_dt = datetime.fromisoformat(_raw_end)
+            except ValueError:
+                try:
+                    _end_dt = datetime.strptime(_raw_end, "%Y-%m-%d")
+                except ValueError:
+                    _end_dt = None
+        else:
+            _end_dt = None
+
         market = SimpleNamespace(
             id=raw_market["id"],
             event_id=event.id,
@@ -42,15 +61,9 @@ def normalize_gamma_event(
             slug=raw_market["slug"],
             active=raw_market.get("active", True),
             closed=raw_market.get("closed", False),
-            resolution_source=raw_market.get("resolution_source"),
-            end_date_iso=(
-                datetime.fromisoformat(
-                    raw_market["end_date_iso"].replace("Z", "+00:00")
-                )
-                if raw_market.get("end_date_iso")
-                else None
-            ),
-            market_type=(raw_market.get("market_type") or "binary").lower(),
+            resolution_source=raw_market.get("resolution_source") or raw_market.get("resolutionSource"),
+            end_date_iso=_end_dt,
+            market_type=(raw_market.get("market_type") or raw_market.get("marketType") or "binary").lower(),
         )
         markets.append(market)
 
@@ -91,6 +104,16 @@ def normalize_gamma_event(
         else:
             outcome_prices = outcome_prices_raw if outcome_prices_raw else []
 
+        # Real bid/ask spread from the Gamma API (available for Yes/primary outcome).
+        # spread = bestAsk - bestBid; bestAsk is for the primary (Yes) outcome.
+        _api_spread   = raw_market.get("spread")
+        _api_best_ask = raw_market.get("bestAsk")
+        try:
+            _api_spread   = float(_api_spread)   if _api_spread   is not None else None
+            _api_best_ask = float(_api_best_ask) if _api_best_ask is not None else None
+        except (ValueError, TypeError):
+            _api_spread = _api_best_ask = None
+
         for i, outcome_name in enumerate(raw_outcomes):
             asset_id = clob_ids[i] if i < len(clob_ids) else ""
             outcome = SimpleNamespace(
@@ -103,11 +126,17 @@ def normalize_gamma_event(
             if i < len(outcome_prices):
                 try:
                     price_val = float(outcome_prices[i])
-                    all_prices.append({
+                    # Attach real spread/ask data only to the primary (i==0) outcome,
+                    # which is the Yes token for binary markets.
+                    price_entry: Dict[str, Any] = {
                         "market_id":    market.id,
                         "outcome_name": outcome_name,
                         "price":        price_val,
-                    })
+                    }
+                    if i == 0 and _api_spread is not None and _api_best_ask is not None:
+                        price_entry["api_spread"]   = _api_spread
+                        price_entry["api_best_ask"] = _api_best_ask
+                    all_prices.append(price_entry)
                 except (ValueError, TypeError):
                     pass
 

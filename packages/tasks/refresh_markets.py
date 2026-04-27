@@ -9,6 +9,30 @@ logger = logging.getLogger(__name__)
 
 PRIORITY_TAG_IDS = [84, 103038, 496, 92, 74]
 
+# Keyword queries sent to Gamma API's ?q= full-text search for strategies
+# whose markets don't reliably surface through tag IDs or volume sorts.
+_STRATEGY_SEARCH_QUERIES: dict = {
+    "weather_prediction": [
+        "highest temperature", "daily high temperature",
+        "degrees fahrenheit", "degrees celsius",
+        "high temperature exceed", "temperature will be",
+        "precipitation", "rainfall", "inches of rain", "mm of rain",
+    ],
+    "laddering": [
+        "highest temperature", "daily high temperature",
+        "degrees fahrenheit", "degrees celsius",
+        "precipitation", "rainfall", "inches of rain", "mm of rain",
+    ],
+    "disaster":  ["hurricane", "flood", "wildfire", "tsunami", "cyclone", "tornado",
+                  "earthquake", "magnitude", "seismic", "eruption", "volcanic"],
+}
+
+# Strategies that skip the volume-based Pass 1 (refresh_active_markets).
+# These strategies need niche markets that don't rank on volume.
+_SKIP_VOLUME_PASS = frozenset({
+    "weather_prediction", "laddering", "disaster",
+})
+
 
 async def _fetch_all_tags() -> list:
     try:
@@ -46,11 +70,17 @@ async def refresh_markets_for_strategy(strategy: str, limit: int = 100) -> int:
         f"(limit={limit}, tags={tag_labels}, keywords={len(keywords)})..."
     )
 
-    # Pass 1: volume-based — keep prices fresh, scaled to limit
-    volume_limit = min(limit, 200)
-    await service.refresh_active_markets(limit=volume_limit)
+    # Pass 1: volume-based — skipped for niche strategies (weather/seismic/disaster)
+    # because high-volume markets are irrelevant to them and would pollute the DB.
+    if strategy in _SKIP_VOLUME_PASS:
+        logger.info(f"[Market Update] Skipping volume pass for '{strategy}' — keyword-only fetch.")
+        volume_limit = 0
+    else:
+        volume_limit = min(limit, 200)
+        await service.refresh_active_markets(limit=volume_limit)
 
-    if not tag_labels and not keywords:
+    has_search_queries = bool(_STRATEGY_SEARCH_QUERIES.get(strategy))
+    if not tag_labels and not keywords and not has_search_queries:
         logger.info("[Market Update] No strategy-specific tags — volume pass only.")
         return volume_limit
 
@@ -96,6 +126,32 @@ async def refresh_markets_for_strategy(strategy: str, limit: int = 100) -> int:
                             logger.debug(f"[Market Update] upsert skipped: {e}")
             except Exception as e:
                 logger.warning(f"[Market Update] tag {tag_id} failed: {e}")
+
+        # Pass 3: keyword-search fetch for strategies with niche markets
+        # (temperature buckets, earthquakes, disasters) that don't rank highly
+        # on volume and may not match tag IDs reliably.
+        search_queries = _STRATEGY_SEARCH_QUERIES.get(strategy, [])
+        if search_queries and len(seen_event_ids) < limit:
+            remaining = limit - len(seen_event_ids)
+            per_query  = max(20, remaining // len(search_queries))
+            for query in search_queries:
+                if len(seen_event_ids) >= limit:
+                    break
+                try:
+                    kw_events = await gc.search_events(query, max_events=per_query)
+                    for raw_event in kw_events:
+                        eid = raw_event.get("id")
+                        if eid not in seen_event_ids:
+                            seen_event_ids.add(eid)
+                            try:
+                                await service.upsert_event(raw_event)
+                            except Exception as e:
+                                logger.debug(f"[Market Update] keyword upsert skipped: {e}")
+                    logger.info(
+                        f"[Market Update] keyword '{query}' → {len(kw_events)} events"
+                    )
+                except Exception as e:
+                    logger.warning(f"[Market Update] keyword search '{query}' failed: {e}")
 
     finally:
         await gc.close()

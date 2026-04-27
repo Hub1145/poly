@@ -136,6 +136,39 @@ class GammaClient:
         return all_events[:max_events]
 
 
+    async def search_events(self, query: str, max_events: int = 100) -> List[Dict[str, Any]]:
+        """
+        Full-text search for events matching a keyword query via the Gamma API `?q=` param.
+        Used to fetch niche markets (temperature, seismic, etc.) that may not surface in
+        volume-sorted feeds or tag-based queries.
+        """
+        all_events: List[Dict[str, Any]] = []
+        page_size = 50
+        offset    = 0
+        while len(all_events) < max_events:
+            params = {
+                "limit":     page_size,
+                "offset":    offset,
+                "active":    "true",
+                "closed":    "false",
+                "q":         query,
+                "order":     "volume24hr",
+                "ascending": "false",
+            }
+            try:
+                response = await self.client.get("/events", params=params)
+                response.raise_for_status()
+                batch = response.json()
+            except Exception:
+                break
+            if not batch:
+                break
+            all_events.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return all_events[:max_events]
+
     async def get_event(self, event_id: str) -> Dict[str, Any]:
         """Fetch a single event by ID."""
         response = await self.client.get(f"/events/{event_id}")

@@ -1,24 +1,29 @@
 """
 Weather / Meteorological Alpha Signal
 ======================================
-Implements three signal types based on documented profitable-trader strategies:
+Data sources used per strategy and geography:
 
-  Signal 1 — Temperature Ladder YES (primary daily signal)
-    Fetch Open-Meteo probability distribution for the city.
-    Lead leg: bucket has >35% model probability but Polymarket prices it
-    below that by more than MIN_GAP_PP percentage points → YES.
-    Also layer adjacent ±1°C/°F buckets if >15% model prob and underpriced.
-    gopfan2 rule: any bucket priced below $0.10 that model gives >20% → YES.
+  Temperature markets (weather_prediction, laddering):
+    PRIMARY  — Open-Meteo Ensemble API, ECMWF IFS 51-member (global, 15-day, 0.25°)
+    FALLBACK1 — Open-Meteo Ensemble API, NOAA GEFS 31-member (global, 16-day, 0.25°)
+    FALLBACK2 — Open-Meteo Ensemble API, DWD ICON-EPS 40-member (global, 7.5-day)
+    US CROSS-CHECK — NOAA NWS api.weather.gov deterministic forecast (US cities only,
+                      free/no-key, 7-day hourly). Used to validate Open-Meteo direction
+                      for US markets; if NWS and ensemble disagree, signal strength is
+                      reduced 20%.
 
-  Signal 2 — Structural NO (75% base-rate bias)
-    YES priced $0.20–$0.45 but model gives <5% probability → NO.
-    gopfan2 hard rule: YES above $0.45 + model agrees it's overpriced → NO.
+  Disaster markets (wind/precipitation events):
+    Open-Meteo standard forecast API (single-model, hourly wind gusts + precipitation).
 
-  Signal 3 — Disaster/alert (opportunistic)
-    Uses wind/gust data from Open-Meteo for hurricane/flood threshold markets.
-    Precipitation quantity markets are skipped entirely (resolution-mismatch risk).
+  Seismic markets:
+    USGS Earthquake Catalog API (live, real-time, no key) — see market_aggregation.py.
 
-Data source: Open-Meteo (free, global, ECMWF/GFS data, no API key needed).
+NOAA GEFS is accessed via Open-Meteo's ensemble wrapper (model=gefs025), NOT via
+raw GRIB2 files. This avoids S3/GRIB2 infrastructure while still using NOAA's
+31-member probabilistic output.
+
+NOAA NWS covers US territory only (continental + AK + HI). For all non-US cities
+the NWS cross-check step is skipped automatically.
 """
 
 import logging
@@ -133,11 +138,21 @@ _STORM_KW    = {"tornado", "blizzard", "ice storm", "hail", "severe weather",
 _DISASTER_KW = {"warning", "watch", "advisory", "emergency", "evacuation",
                 "red flag", "flood warning", "hurricane warning"}
 
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+OPEN_METEO_URL          = "https://api.open-meteo.com/v1/forecast"
+HISTORICAL_FORECAST_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
 
 # In-memory forecast cache — 30 min TTL
 _FORECAST_CACHE: dict = {}
 _CACHE_TTL = 1800
+
+# Precipitation bucket mutual-exclusivity tracker (city, year, month, unit) → winning question
+_PRECIP_WINNERS: dict = {}
+
+_MONTH_NAMES: Dict[str, int] = {
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11, "december": 12,
+}
 
 
 def _cache_key(lat, lon, target_date, unit, weather_type, past_days):
@@ -673,8 +688,12 @@ HIGH_VOLUME_CITIES = {
 }
 
 ENSEMBLE_API_URL = "https://ensemble-api.open-meteo.com/v1/ensemble"
+NWS_API_URL      = "https://api.weather.gov"
+
 _ENSEMBLE_CACHE: dict = {}
-_ENSEMBLE_CACHE_TTL = 3600  # 60 min — refresh once per model-run cycle
+_NWS_CACHE: dict      = {}
+_ENSEMBLE_CACHE_TTL   = 3600   # 60 min — aligned with model-run cycle
+_NWS_CACHE_TTL        = 3600   # NWS updates every 6 h; 60 min is safe
 
 # Temperature bucket mutual exclusivity:
 # For each (city, date, unit) group of competing temperature buckets, only ONE
@@ -684,10 +703,84 @@ _ENSEMBLE_CACHE_TTL = 3600  # 60 min — refresh once per model-run cycle
 # Key: (city_name_lower, target_date, unit) → winning question (lower-cased)
 _BUCKET_WINNERS: dict = {}
 
-# Primary: ECMWF IFS 51-member ensemble (industry standard, 6-hourly updates)
-# Fallback: ICON seamless 40-member (global, free)
-_ENSEMBLE_MODEL_PRIMARY  = "ecmwf_ifs025"
-_ENSEMBLE_MODEL_FALLBACK = "icon_seamless"
+# Ensemble model cascade (tried in order until one succeeds):
+#   1. ECMWF IFS 0.25° — 51 members, global, 15-day (industry gold standard)
+#   2. NOAA GEFS 0.25° — 31 members, global, 16-day (accessed via Open-Meteo)
+#   3. DWD ICON-EPS    — 40 members, global, 7.5-day (European model, last resort)
+_ENSEMBLE_MODEL_PRIMARY   = "ecmwf_ifs025"
+_ENSEMBLE_MODEL_FALLBACK1 = "gefs025"        # NOAA GEFS 31-member via Open-Meteo
+_ENSEMBLE_MODEL_FALLBACK2 = "icon_seamless"  # DWD ICON 40-member
+
+# US cities whose lat/lon is within NOAA NWS coverage (continental US + AK + HI).
+# NWS is used as a CROSS-CHECK for these cities: if NWS deterministic forecast
+# disagrees with the ensemble direction, signal strength is reduced by 20%.
+_NWS_CITIES: frozenset = frozenset({
+    "New York", "NYC", "Los Angeles", "LA", "Chicago", "Houston", "Phoenix",
+    "Philadelphia", "San Diego", "Dallas", "Miami", "Atlanta", "Seattle",
+    "Boston", "Denver", "Las Vegas", "Washington", "San Francisco", "SF",
+})
+
+
+async def _fetch_nws_hourly(lat: float, lon: float) -> Dict[str, Any]:
+    """
+    Fetch NOAA NWS hourly forecast for a US lat/lon.
+    Two-step: /points → gridpoint URL → /forecast/hourly
+    Returns {"time": [...], "temperature": [...], "unit": "F"} or {}
+    NWS only covers US territory — returns {} for non-US coords.
+    """
+    key = ("nws", round(lat, 3), round(lon, 3))
+    entry = _NWS_CACHE.get(key)
+    if entry and (_time.monotonic() - entry["ts"]) < _NWS_CACHE_TTL:
+        return entry["data"]
+
+    headers = {"User-Agent": "PolymarketAlphaBot (polymarket-alpha@localhost)"}
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            # Step 1: resolve grid point
+            r1 = await client.get(
+                f"{NWS_API_URL}/points/{lat:.4f},{lon:.4f}",
+                headers=headers,
+            )
+            if r1.status_code != 200:
+                return {}
+            props    = r1.json().get("properties", {})
+            hourly_url = props.get("forecastHourly")
+            if not hourly_url:
+                return {}
+
+            # Step 2: fetch hourly forecast
+            r2 = await client.get(hourly_url, headers=headers)
+            if r2.status_code != 200:
+                return {}
+            periods = r2.json().get("properties", {}).get("periods", [])
+
+        data = {
+            "time":        [p["startTime"][:10] for p in periods],  # YYYY-MM-DD
+            "temperature": [p["temperature"]     for p in periods],
+            "unit":        "F" if (periods[0]["temperatureUnit"] == "F" if periods else True) else "C",
+            "_periods":    periods,  # keep full records for hourly lookup
+        }
+        _NWS_CACHE[key] = {"data": data, "ts": _time.monotonic()}
+        return data
+    except Exception as e:
+        logger.debug(f"[NWS] Fetch failed ({lat},{lon}): {e}")
+        return {}
+
+
+def _nws_daily_max(nws_data: Dict[str, Any], target_date: str) -> Optional[float]:
+    """Return the NWS predicted daily high for target_date, or None."""
+    periods = nws_data.get("_periods", [])
+    day_temps = [
+        p["temperature"] for p in periods
+        if p.get("startTime", "").startswith(target_date) and p.get("isDaytime", True)
+    ]
+    if not day_temps:
+        # Fallback: any hour for that date
+        day_temps = [
+            p["temperature"] for p in periods
+            if p.get("startTime", "").startswith(target_date)
+        ]
+    return max(day_temps) if day_temps else None
 
 
 async def _fetch_ensemble_forecast(
@@ -699,9 +792,9 @@ async def _fetch_ensemble_forecast(
     model: str = _ENSEMBLE_MODEL_PRIMARY,
 ) -> Dict[str, Any]:
     """
-    Fetch ECMWF 51-member (or ICON 40-member) ensemble from Open-Meteo.
-    Cached for 60 minutes — aligned with model-run update cycle.
-    Falls back to ICON seamless if ECMWF is unavailable.
+    Fetch ensemble forecast from Open-Meteo.
+    Cascade order: ECMWF IFS (51) → NOAA GEFS (31) → DWD ICON (40).
+    Cached 60 minutes per model/location.
     """
     key = ("ensemble", round(lat, 4), round(lon, 4), target_date, unit, past_days, model)
     entry = _ENSEMBLE_CACHE.get(key)
@@ -712,7 +805,7 @@ async def _fetch_ensemble_forecast(
         "latitude":         lat,
         "longitude":        lon,
         "hourly":           "temperature_2m",
-        "models":           model,   # ecmwf_ifs025 = 51 members; icon_seamless = 40 members
+        "models":           model,
         "forecast_days":    1 if past_days > 0 else 16,
         "temperature_unit": "fahrenheit" if unit == "F" else "celsius",
         "timezone":         "auto",
@@ -728,11 +821,18 @@ async def _fetch_ensemble_forecast(
             _ENSEMBLE_CACHE[key] = {"data": data, "ts": _time.monotonic()}
             return data
     except Exception as e:
-        logger.warning(f"Open-Meteo ensemble fetch failed ({lat},{lon}) model={model}: {e}")
-        # Fallback: try ICON seamless if ECMWF failed
-        if model != _ENSEMBLE_MODEL_FALLBACK:
-            logger.info(f"[WX-Ensemble] Falling back to {_ENSEMBLE_MODEL_FALLBACK}...")
-            return await _fetch_ensemble_forecast(lat, lon, target_date, unit, past_days, _ENSEMBLE_MODEL_FALLBACK)
+        logger.warning(f"[WX-Ensemble] {model} failed ({lat:.2f},{lon:.2f}): {e}")
+        # Cascade to next fallback
+        if model == _ENSEMBLE_MODEL_PRIMARY:
+            logger.info("[WX-Ensemble] ECMWF failed — trying NOAA GEFS...")
+            return await _fetch_ensemble_forecast(
+                lat, lon, target_date, unit, past_days, _ENSEMBLE_MODEL_FALLBACK1
+            )
+        if model == _ENSEMBLE_MODEL_FALLBACK1:
+            logger.info("[WX-Ensemble] GEFS failed — trying DWD ICON...")
+            return await _fetch_ensemble_forecast(
+                lat, lon, target_date, unit, past_days, _ENSEMBLE_MODEL_FALLBACK2
+            )
         return {}
 
 
@@ -918,6 +1018,149 @@ def _ensemble_probability(daily_maxes: list, question: str, unit: str) -> Option
     return max(0.01, min(0.99, count / n))
 
 
+async def compute_ladder_weather_alpha(
+    question: str,
+    current_price: float,
+) -> Optional[Tuple[float, str]]:
+    """
+    Laddering strategy scorer for temperature bucket markets.
+
+    Unlike compute_ensemble_weather_alpha which forces NO on all non-winning
+    buckets, this function:
+      - Scores the WINNER bucket as a strong YES
+      - Scores ADJACENT buckets as YES if the model still gives them meaningful
+        probability (don't force them NO just because a neighbour is better)
+      - Only forces NO on buckets the model considers clearly overpriced
+
+    This produces YES signals on 2-3 adjacent buckets per city+date, which
+    the execute engine distributes as ladder legs at reduced per-leg sizing.
+    """
+    weather_type = _detect_weather_type(question)
+    if weather_type not in ("temperature",):
+        return None
+
+    city_result = _find_city(question)
+    if not city_result:
+        return None
+
+    city_name, coords = city_result
+    target_date = _find_date(question)
+    if not target_date:
+        return None
+
+    unit = "F" if re.search(r"\bF\b|fahrenheit", question, re.IGNORECASE) else "C"
+
+    utc_offset_h = round(coords["lon"] / 15.0)
+    local_now    = _dt.now(_tz.utc) + _td(hours=utc_offset_h)
+    local_today  = local_now.strftime("%Y-%m-%d")
+    past_days    = 0
+
+    if target_date < local_today:
+        try:
+            days_back = (_date.fromisoformat(local_today) - _date.fromisoformat(target_date)).days
+        except ValueError:
+            days_back = 99
+        if days_back > 7:
+            return None
+        past_days = days_back + 1
+
+    is_low_market = any(kw in question.lower() for kw in (
+        "low", "minimum", "min", "overnight", "nightly", "coldest"
+    ))
+    ensemble_data = await _fetch_ensemble_forecast(
+        coords["lat"], coords["lon"], target_date, unit, past_days=past_days
+    )
+    if not ensemble_data:
+        return None
+
+    member_temps = _ensemble_daily_stats(ensemble_data, target_date, use_min=is_low_market)
+    if len(member_temps) < 5:
+        return None
+
+    forecast_prob = _ensemble_probability(member_temps, question, unit)
+    if forecast_prob is None:
+        return None
+
+    n_members     = len(member_temps)
+    ensemble_mean = sum(member_temps) / n_members
+    ensemble_spread = max(member_temps) - min(member_temps)
+    source        = "historical" if past_days > 0 else "ensemble"
+    if n_members >= 50:
+        model_label = "ECMWF-51"
+    elif n_members >= 30:
+        model_label = f"GEFS-{n_members}"
+    else:
+        model_label = f"ICON-{n_members}"
+    is_focus      = city_name in HIGH_VOLUME_CITIES
+    focus_tag     = "" if is_focus else " [non-priority city]"
+    ref_label     = "low" if is_low_market else "high"
+
+    min_gap = WEATHER_MIN_GAP_PP / 100.0
+    gap     = forecast_prob - current_price
+
+    # ── Bucket winner check ───────────────────────────────────────────────────
+    winner_key = (city_name.lower(), target_date, unit)
+    is_winner  = True
+    if winner_key in _BUCKET_WINNERS:
+        winner_q = _BUCKET_WINNERS[winner_key]
+        this_q   = question.lower()
+        if this_q != winner_q:
+            is_winner = False
+
+    market_threshold = _extract_market_threshold(question, unit)
+    temp_diff = (ensemble_mean - market_threshold) if market_threshold is not None else 0.0
+
+    # ── Adjacency: within 1 ensemble std-dev of the forecast mean ────────────
+    # ensemble_spread is max-min of all members; divide by 4 ≈ 1 sigma.
+    # Only buckets whose threshold falls within this range of the mean are
+    # considered "adjacent" — tighter than a loose gap check.
+    ensemble_sigma  = max(1.5, ensemble_spread / 4.0)
+    is_truly_adjacent = (
+        market_threshold is not None
+        and abs(market_threshold - ensemble_mean) <= ensemble_sigma
+        and not is_winner
+    )
+
+    if is_winner:
+        # Winner bucket: signal YES if model shows meaningful edge
+        if gap < min_gap:
+            return None
+        edge = gap
+        rule = f"WINNER YES (P={forecast_prob*100:.0f}%, market={current_price*100:.0f}%, gap={gap:+.2f})"
+    elif is_truly_adjacent:
+        # Genuinely adjacent bucket (within forecast uncertainty): smaller YES leg
+        if gap <= 0:
+            return None   # model doesn't support this bucket at all
+        edge = gap * 0.5  # half strength vs winner — clearly secondary
+        rule = f"ADJACENT YES within {ensemble_sigma:.1f}{unit} sigma (P={forecast_prob*100:.0f}%, gap={gap:+.2f})"
+    else:
+        # Not adjacent and not the winner → NO if clearly overpriced, else skip
+        if gap < -min_gap:
+            edge = gap
+            rule = f"NO (P={forecast_prob*100:.0f}% far below market={current_price*100:.0f}%)"
+        else:
+            return None  # neutral, skip
+
+    if abs(edge) < 0.03:
+        return None
+
+    market_part = (
+        f"Threshold {market_threshold:.1f}{unit} (diff={temp_diff:+.1f}{unit})"
+        if market_threshold is not None else "N/A"
+    )
+    bucket_label = "WINNER" if is_winner else ("ADJACENT" if is_truly_adjacent else "NO")
+    explanation  = (
+        f"[Ladder-{bucket_label}{focus_tag}] {city_name} {target_date} | "
+        f"{model_label} {source}: forecast {ref_label} {ensemble_mean:.1f}{unit} "
+        f"(+/-{ensemble_spread/2:.1f}, {n_members} members) | "
+        f"{market_part} | "
+        f"P(condition)={forecast_prob*100:.1f}% vs {current_price*100:.1f}% priced | "
+        f"Rule: {rule}. Edge={edge:+.3f}."
+    )
+    logger.info(f"[Ladder] {city_name} '{question[:50]}': {explanation}")
+    return edge, explanation
+
+
 async def compute_ensemble_weather_alpha(
     question: str,
     current_price: float,
@@ -988,8 +1231,13 @@ async def compute_ensemble_weather_alpha(
     source         = "historical" if past_days > 0 else "ensemble"
     is_focus       = city_name in HIGH_VOLUME_CITIES
 
-    # ── Detect which model is being used (ECMWF = 51 members, ICON = 40) ──────
-    model_label = "ECMWF-51" if n_members >= 50 else f"ICON-{n_members}"
+    # ── Detect which model is being used ─────────────────────────────────────
+    if n_members >= 50:
+        model_label = "ECMWF-51"
+    elif n_members >= 30:
+        model_label = f"GEFS-{n_members}"    # NOAA GEFS via Open-Meteo
+    else:
+        model_label = f"ICON-{n_members}"   # DWD ICON fallback
 
     # ── Direct temperature gap: ensemble mean vs market's implied threshold ────
     # Core insight from strategy description: edge when forecast differs from
@@ -1033,6 +1281,34 @@ async def compute_ensemble_weather_alpha(
             logger.info(f"[WX-Bucket-NO] {city_name} '{question[:50]}': {explanation}")
             return forced_edge, explanation
 
+    # ── NOAA NWS cross-check (US cities only) ────────────────────────────────
+    # NWS provides an independent deterministic forecast from NOAA's operational
+    # models. If NWS daily high disagrees with the ensemble direction (i.e. NWS
+    # says the temperature is ABOVE the market threshold but ensemble says NO, or
+    # vice versa) we reduce signal strength by 20% to reflect the disagreement.
+    # NWS is US-only; the check is silently skipped for non-US cities.
+    nws_note = ""
+    if city_name in _NWS_CITIES and past_days == 0 and market_threshold is not None:
+        nws_data = await _fetch_nws_hourly(coords["lat"], coords["lon"])
+        if nws_data:
+            nws_max = _nws_daily_max(nws_data, target_date)
+            if nws_max is not None:
+                # ensemble says YES → expects temp >= threshold; NWS says below → disagreement
+                # ensemble says NO  → expects temp < threshold; NWS says above → disagreement
+                ensemble_direction = "YES" if forecast_prob > current_price else "NO"
+                nws_direction      = "YES" if nws_max >= market_threshold else "NO"
+                if ensemble_direction != nws_direction:
+                    nws_note = (
+                        f" | NWS cross-check DISAGREES (NWS high={nws_max:.1f}{unit}, "
+                        f"threshold={market_threshold:.1f}{unit}) — strength -20%"
+                    )
+                    logger.info(
+                        f"[NWS] {city_name} {target_date}: ensemble={ensemble_direction} "
+                        f"vs NWS={nws_direction} (NWS max={nws_max:.1f}) — reducing strength"
+                    )
+                else:
+                    nws_note = f" | NWS confirms: {nws_max:.1f}{unit} vs threshold {market_threshold:.1f}{unit}"
+
     # ── Signal rules (winner bucket or ungrouped market) ─────────────────────
     min_gap   = WEATHER_MIN_GAP_PP / 100.0
     gap       = forecast_prob - current_price
@@ -1050,14 +1326,306 @@ async def compute_ensemble_weather_alpha(
     if abs(edge) < 0.03:
         return None
 
+    # Apply NWS disagreement penalty
+    if "DISAGREES" in nws_note:
+        edge = round(edge * 0.80, 4)
+        if abs(edge) < 0.03:
+            return None
+
     explanation = (
         f"[WX Prediction{focus_tag}] {city_name} {target_date} | "
         f"{model_label} {source}: forecast {ref_label} {ensemble_mean:.1f}{unit} "
         f"(+/-{ensemble_spread/2:.1f}, {n_members} members) | "
-        f"{market_part} | "
+        f"{market_part}{nws_note} | "
         f"P(condition)={forecast_prob*100:.1f}% vs {current_price*100:.1f}% priced | "
         f"Rule: {signal_rule}. Edge={edge:+.3f}."
     )
 
     logger.info(f"[WX-Ensemble] {city_name}: {explanation}")
+    return edge, explanation
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Precipitation Strategy — Open-Meteo Historical Forecast API
+# Monthly accumulation markets ("Will city X have Y-Z inches of precip in April?")
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _find_month_year(question: str) -> Optional[Tuple[int, int]]:
+    """
+    Extract (year, month_int) from a monthly precipitation question.
+    Handles "in April 2026", "in April", "precipitation in April".
+    """
+    q = question.lower()
+    month_pat = (
+        r"(january|february|march|april|may|june|july|"
+        r"august|september|october|november|december)"
+    )
+    # "in April 2026" or "April 2026"
+    m = re.search(month_pat + r"\s+(\d{4})", q)
+    if m:
+        return int(m.group(2)), _MONTH_NAMES[m.group(1)]
+    # "in April" — infer year from current date
+    m = re.search(r"\bin\s+" + month_pat, q)
+    if m:
+        month_n = _MONTH_NAMES[m.group(1)]
+        today = _dt.utcnow()
+        if month_n < today.month:
+            return today.year + 1, month_n
+        return today.year, month_n
+    return None
+
+
+def _parse_precip_threshold(question: str) -> Optional[Dict[str, Any]]:
+    """
+    Parse precipitation threshold from question text.
+    Returns {"type": "between"|"above"|"below", "lo": float, "hi": float}.
+    Values are in whatever unit the question uses (mm or inches).
+    """
+    q = question.lower()
+
+    # "between X and Y" / "X-Y mm" / "X-Y inches"
+    between = re.search(r"between\s+(\d+(?:\.\d+)?)\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q)
+    if not between:
+        between = re.search(
+            r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*(?:mm\b|inches?\b|in\b)", q
+        )
+    if between:
+        return {"type": "between", "lo": float(between.group(1)), "hi": float(between.group(2))}
+
+    # "more than X" / "X or more" / "X mm or more" / "190mm or more"
+    above = re.search(
+        r"(\d+(?:\.\d+)?)\s*(?:mm|inches?)?\s*(?:or more|or above|and above)", q
+    )
+    if not above:
+        above = re.search(r"(?:more than|above|at least)\s+(\d+(?:\.\d+)?)", q)
+    if above:
+        return {"type": "above", "lo": float(above.group(1)), "hi": float("inf")}
+
+    # "less than X" / "below X" / "under X"
+    below = re.search(r"(?:less than|below|at most|or less|or below|under)\s+(\d+(?:\.\d+)?)", q)
+    if below:
+        return {"type": "below", "lo": 0.0, "hi": float(below.group(1))}
+
+    return None
+
+
+async def _fetch_monthly_precipitation(
+    lat: float, lon: float, year: int, month: int, precip_unit: str
+) -> Optional[float]:
+    """
+    Fetch the total monthly precipitation for (lat, lon) from the Open-Meteo
+    historical-forecast API. Covers both past actuals and remaining forecast days
+    in one call. Returns the sum in the requested unit ("mm" or "inch").
+    """
+    import calendar
+    _, last_day = calendar.monthrange(year, month)
+    start_date  = f"{year}-{month:02d}-01"
+    end_date    = f"{year}-{month:02d}-{last_day:02d}"
+
+    key = ("precip_monthly", round(lat, 4), round(lon, 4), year, month, precip_unit)
+    cached = _get_cached(key)
+    if cached is not None:
+        return cached
+
+    params: Dict[str, Any] = {
+        "latitude":          lat,
+        "longitude":         lon,
+        "start_date":        start_date,
+        "end_date":          end_date,
+        "daily":             "precipitation_sum",
+        "timezone":          "auto",
+        "precipitation_unit": precip_unit,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(HISTORICAL_FORECAST_URL, params=params)
+            resp.raise_for_status()
+            data        = resp.json()
+            daily_sums  = data.get("daily", {}).get("precipitation_sum", [])
+            total       = sum(v for v in daily_sums if v is not None)
+            _set_cached(key, total)
+            return total
+    except Exception as e:
+        logger.warning(f"[Precip] Monthly fetch failed ({lat:.2f},{lon:.2f}): {e}")
+        return None
+
+
+async def precompute_precipitation_bucket_winners(markets: list) -> None:
+    """
+    Group monthly precipitation markets by (city, year, month, unit) and determine
+    which bucket the expected monthly total favours most. Stores in _PRECIP_WINNERS
+    so that compute_precipitation_alpha can apply mutual exclusivity.
+    Call this once before the scoring loop — same pattern as
+    precompute_temperature_bucket_winners.
+    """
+    from collections import defaultdict
+
+    _PRECIP_WINNERS.clear()
+    groups: dict = defaultdict(list)
+
+    for m in markets:
+        q = m.question or ""
+        if not any(kw in q.lower() for kw in ("precipitation", "rainfall", "inches of rain", "mm of rain")):
+            continue
+        city_result = _find_city(q)
+        if not city_result:
+            continue
+        month_year = _find_month_year(q)
+        if not month_year:
+            continue
+        city_name, coords = city_result
+        year, month    = month_year
+        precip_unit    = "mm" if "mm" in q.lower() else "inch"
+        key            = (city_name.lower(), year, month, precip_unit)
+        groups[key].append((m, coords, precip_unit))
+
+    for (city_lower, year, month, precip_unit), group in groups.items():
+        if len(group) < 2:
+            continue
+        _, coords, _ = group[0]
+        total = await _fetch_monthly_precipitation(
+            coords["lat"], coords["lon"], year, month, precip_unit
+        )
+        if total is None:
+            continue
+
+        # Tiny sigma just to break ties at bucket boundaries
+        sigma      = max(1.0 if precip_unit == "mm" else 0.05, total * 0.03)
+        best_prob  = -1.0
+        winner_q: Optional[str] = None
+
+        for m, _, _ in group:
+            thr = _parse_precip_threshold(m.question or "")
+            if thr is None:
+                continue
+            if thr["type"] == "between":
+                prob = float(
+                    norm.cdf(thr["hi"], loc=total, scale=sigma) -
+                    norm.cdf(thr["lo"], loc=total, scale=sigma)
+                )
+            elif thr["type"] == "above":
+                prob = float(1.0 - norm.cdf(thr["lo"], loc=total, scale=sigma))
+            else:
+                prob = float(norm.cdf(thr["hi"], loc=total, scale=sigma))
+            if prob > best_prob:
+                best_prob = prob
+                winner_q  = (m.question or "").lower()
+
+        if winner_q:
+            _PRECIP_WINNERS[(city_lower, year, month, precip_unit)] = winner_q
+            logger.info(
+                f"[PrecipWinner] {city_lower} {year}-{month:02d} ({precip_unit}): "
+                f"expected={total:.1f} → winner='{winner_q[:60]}' (P={best_prob*100:.0f}%)"
+            )
+
+
+async def compute_precipitation_alpha(
+    question: str,
+    current_price: float,
+) -> Optional[Tuple[float, str]]:
+    """
+    Compute alpha edge for monthly precipitation bucket markets.
+
+    Uses the Open-Meteo historical-forecast API which returns both past actuals
+    and remaining-month forecast days in one call, giving an up-to-date expected
+    monthly total.  A normal distribution centred on that total (σ proportional to
+    remaining forecast days) converts the expected total into a market probability.
+
+    Returns (edge, explanation) or None.
+      edge > 0  → YES underpriced (buy YES)
+      edge < 0  → NO underpriced (buy NO)
+    """
+    q = question.lower()
+    # Only handle precipitation markets
+    if not any(kw in q for kw in ("precipitation", "rainfall", "inches of rain", "mm of rain")):
+        return None
+
+    city_result = _find_city(question)
+    if not city_result:
+        return None
+    city_name, coords = city_result
+
+    month_year = _find_month_year(question)
+    if not month_year:
+        return None
+    year, month = month_year
+
+    precip_unit = "mm" if "mm" in q else "inch"
+    unit_label  = "mm" if precip_unit == "mm" else "in"
+
+    thr = _parse_precip_threshold(question)
+    if thr is None:
+        return None
+
+    total = await _fetch_monthly_precipitation(
+        coords["lat"], coords["lon"], year, month, precip_unit
+    )
+    if total is None:
+        return None
+
+    # Days remaining in the month — drives forecast uncertainty
+    import calendar
+    from datetime import date as _date_cls
+    _, last_day    = calendar.monthrange(year, month)
+    today          = _dt.utcnow().date()
+    month_end      = _date_cls(year, month, last_day)
+    days_remaining = max(0, (month_end - today).days)
+
+    # σ: std of remaining precipitation sum.  Typical daily precip std ~3 mm / 0.12 in.
+    # σ_sum ≈ σ_daily × √n_remaining_days
+    daily_std = 3.0 if precip_unit == "mm" else 0.12
+    sigma     = max(daily_std, daily_std * (days_remaining ** 0.5))
+
+    # P(monthly total satisfies the market condition)
+    if thr["type"] == "between":
+        prob = float(
+            norm.cdf(thr["hi"], loc=total, scale=sigma) -
+            norm.cdf(thr["lo"], loc=total, scale=sigma)
+        )
+    elif thr["type"] == "above":
+        prob = float(1.0 - norm.cdf(thr["lo"], loc=total, scale=sigma))
+    else:
+        prob = float(norm.cdf(thr["hi"], loc=total, scale=sigma))
+    prob = max(0.01, min(0.99, prob))
+
+    # Mutual exclusivity — force NO on losing buckets
+    winner_key = (city_name.lower(), year, month, precip_unit)
+    is_loser   = (
+        winner_key in _PRECIP_WINNERS
+        and question.lower() != _PRECIP_WINNERS[winner_key]
+    )
+
+    min_gap = WEATHER_MIN_GAP_PP / 100.0
+    gap     = prob - current_price
+
+    if is_loser:
+        if gap >= -0.03:
+            return None  # market already near-zero priced — no edge
+        edge = gap
+        rule = f"LOSER → NO (P={prob*100:.1f}% vs market={current_price*100:.1f}%)"
+    else:
+        if abs(gap) <= min_gap:
+            return None
+        edge      = gap
+        direction = "YES" if gap > 0 else "NO"
+        rule      = f"{direction} (P={prob*100:.1f}%, market={current_price*100:.1f}%, gap={gap:+.2f})"
+
+    if abs(edge) < 0.03:
+        return None
+
+    status = "complete" if days_remaining == 0 else f"{days_remaining}d remaining"
+    if thr["type"] == "between":
+        thr_str = f"{thr['lo']}-{thr['hi']}{unit_label}"
+    elif thr["type"] == "above":
+        thr_str = f"≥{thr['lo']}{unit_label}"
+    else:
+        thr_str = f"<{thr['hi']}{unit_label}"
+
+    explanation = (
+        f"[Precip] {city_name} {year}-{month:02d} | "
+        f"Open-Meteo accumulated={total:.1f}{unit_label} ({status}, sigma={sigma:.1f}) | "
+        f"Condition {thr_str} → P={prob*100:.1f}% vs {current_price*100:.1f}% market | "
+        f"Rule: {rule}. Edge={edge:+.3f}."
+    )
+    logger.info(f"[Precip] {city_name} {year}-{month:02d}: {explanation}")
     return edge, explanation

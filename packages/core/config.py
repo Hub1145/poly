@@ -43,9 +43,12 @@ class AppSettings(BaseModel):
     # Trading parameters persisted by the UI Settings tab via /api/config
     trade_amount: float = 10.0      # total ladder budget per city, split across legs
     min_edge: float = 0.12          # raised for higher conviction filter
-    scan_interval: int = 30
+    scan_interval: int = 5
     paper_balance: float = 1000.0
     max_trades: int = 8             # concentrate capital
+    # Position management — % of entry price
+    take_profit: float = 50.0       # close when price rises 50% above entry (default)
+    stop_loss: float = 30.0         # close when price falls 30% below entry (default)
 
 # Hardcoded weather strategy constants — not user-configurable.
 WEATHER_MIN_GAP_PP: float        = 12.0   # min %-point gap model vs market price
@@ -90,6 +93,7 @@ class Settings(BaseSettings):
                     _app_keys = {
                         "paper_mode", "trade_amount", "min_edge",
                         "scan_interval", "paper_balance", "max_trades",
+                        "take_profit", "stop_loss",
                     }
                     _poly_keys = {"private_key"}
 

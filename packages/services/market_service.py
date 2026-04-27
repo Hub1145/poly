@@ -117,12 +117,21 @@ class MarketService:
                     if oid is None:
                         continue
                     pv = pd_row["price"]
+                    # Use real CLOB spread/ask from the Gamma API when available.
+                    # These fields are set on the primary (Yes) outcome only.
+                    api_ask    = pd_row.get("api_best_ask")
+                    api_spread = pd_row.get("api_spread")
+                    if api_ask is not None and api_spread is not None:
+                        best_ask = min(1.0, api_ask)
+                        best_bid = max(0.0, api_ask - api_spread)
+                    else:
+                        best_ask = min(1.0, pv + 0.01)
+                        best_bid = max(0.0, pv - 0.01)
                     await self.db.execute(
                         "INSERT INTO price_snapshots"
                         " (market_id, outcome_id, best_bid, best_ask, mid_price, timestamp)"
                         " VALUES (?, ?, ?, ?, ?, ?)",
-                        (pd_row["market_id"], oid,
-                         max(0.0, pv - 0.01), min(1.0, pv + 0.01), pv, now),
+                        (pd_row["market_id"], oid, best_bid, best_ask, pv, now),
                     )
 
                 if (i + 1) % 50 == 0:
@@ -231,12 +240,19 @@ class MarketService:
             if oid is None:
                 continue
             pv = pd_row["price"]
+            api_ask    = pd_row.get("api_best_ask")
+            api_spread = pd_row.get("api_spread")
+            if api_ask is not None and api_spread is not None:
+                best_ask = min(1.0, api_ask)
+                best_bid = max(0.0, api_ask - api_spread)
+            else:
+                best_ask = min(1.0, pv + 0.01)
+                best_bid = max(0.0, pv - 0.01)
             await self.db.execute(
                 "INSERT INTO price_snapshots"
                 " (market_id, outcome_id, best_bid, best_ask, mid_price, timestamp)"
                 " VALUES (?, ?, ?, ?, ?, ?)",
-                (pd_row["market_id"], oid,
-                 max(0.0, pv - 0.01), min(1.0, pv + 0.01), pv, now),
+                (pd_row["market_id"], oid, best_bid, best_ask, pv, now),
             )
 
         await self.db.commit()

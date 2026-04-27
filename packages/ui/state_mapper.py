@@ -16,10 +16,13 @@ _STRATEGY_SIGNAL_TYPES: Dict[str, List[str]] = {
     "black_swan":           ["black_swan"],
     "no_bias":              ["no_bias"],
     "laddering":            ["weather_laddering"],
-    "disaster":             ["weather_disaster"],
-    "seismic":              ["seismic"],
+    "disaster":             ["weather_disaster", "seismic"],
     "weather_prediction":   ["weather_prediction"],
 }
+
+_TRADER_STRATEGIES: frozenset = frozenset({
+    "bayesian_ensemble", "conservative_snw", "aggressive_whale", "specialist_precision",
+})
 
 _STRATEGY_FALLBACK_TAGS: Dict[str, List[str]] = {
     "bayesian_ensemble":    ["Politics", "Crypto", "Entertainment", "Sports", "Science"],
@@ -30,9 +33,9 @@ _STRATEGY_FALLBACK_TAGS: Dict[str, List[str]] = {
     "black_swan":           ["Science", "Natural Disasters", "Global Warming"],
     "long_range":           ["Politics", "Science", "Economic"],
     "volatility":           ["Crypto", "Sports", "Politics"],
+    "weather_prediction":   ["Weather"],
     "laddering":            ["Weather"],
-    "disaster":             ["Natural Disasters"],
-    "seismic":              ["Earthquakes"],
+    "disaster":             ["Natural Disasters", "Earthquakes"],
 }
 
 
@@ -47,6 +50,7 @@ async def map_db_to_bot_state(
     All metrics are derived from real data — no hardcoded placeholders.
     """
     db = get_db()
+    active_strategy = settings.strategy
 
     # ------------------------------------------------------------------ #
     # 1. Core metrics                                                       #
@@ -62,10 +66,12 @@ async def map_db_to_bot_state(
         (bot_address,),
     ) or 0
 
-    skilled_count = await db.fetchval(
-        "SELECT COUNT(address) FROM trader_classifications"
-        " WHERE label IN ('whale','serious_non_whale','topic_specialist')"
-    ) or 0
+    skilled_count = 0
+    if active_strategy in _TRADER_STRATEGIES:
+        skilled_count = await db.fetchval(
+            "SELECT COUNT(address) FROM trader_classifications"
+            " WHERE label IN ('whale','serious_non_whale','topic_specialist')"
+        ) or 0
 
     win_row = await db.fetchone(
         """
@@ -87,7 +93,6 @@ async def map_db_to_bot_state(
     # ------------------------------------------------------------------ #
     # 2. Market signal snapshots → scanned_markets + dev_check_logs        #
     # ------------------------------------------------------------------ #
-    active_strategy = settings.strategy
     signal_types    = _STRATEGY_SIGNAL_TYPES.get(active_strategy, ["bayesian_ensemble"])
     placeholders    = ",".join("?" * len(signal_types))
 
@@ -179,31 +184,42 @@ async def map_db_to_bot_state(
             })
 
     # ------------------------------------------------------------------ #
-    # 3. Recent skilled-trader activity feed                               #
+    # 3. Recent skilled-trader activity feed (trader strategies only)     #
     # ------------------------------------------------------------------ #
-    feed_rows = await db.fetchall(
-        """
-        SELECT t.trader_address, t.side, t.notional, t.size,
-               tc.label, m.question
-        FROM trades t
-        JOIN trader_classifications tc ON tc.address = t.trader_address
-        JOIN markets m ON m.id = t.market_id
-        WHERE tc.label IN ('whale','serious_non_whale','topic_specialist')
-        ORDER BY t.timestamp DESC
-        LIMIT 10
-        """
-    )
     news_events = []
-    for row in feed_rows:
-        notional_val = float(row.notional if row.notional is not None else (row.size or 0.0))
-        direction = "+" if (row.side or "").upper() in ("YES", "BUY") else "-"
-        news_events.append({
-            "trader":   row.trader_address[:12] + "...",
-            "label":    row.label.upper(),
-            "activity": f"{(row.side or '').upper()} ${notional_val:.2f}",
-            "impact":   f"{direction}{notional_val / 100:.1f}%",
-            "summary":  f"Entered {row.side} on '{row.question[:30]}...'",
-        })
+    if active_strategy in _TRADER_STRATEGIES:
+        # One row per unique market — most recent skilled trade in each.
+        # Prevents the feed from showing 10 trades all from the same market
+        # when a large batch was just ingested from a single high-volume market.
+        feed_rows = await db.fetchall(
+            """
+            SELECT t.trader_address, t.side, t.notional, t.size,
+                   tc.label, m.question
+            FROM trades t
+            JOIN trader_classifications tc ON tc.address = t.trader_address
+            JOIN markets m ON m.id = t.market_id
+            WHERE tc.label IN ('whale','serious_non_whale','topic_specialist')
+              AND t.id IN (
+                  SELECT MAX(t2.id)
+                  FROM trades t2
+                  JOIN trader_classifications tc2 ON tc2.address = t2.trader_address
+                  WHERE tc2.label IN ('whale','serious_non_whale','topic_specialist')
+                  GROUP BY t2.market_id
+              )
+            ORDER BY t.timestamp DESC
+            LIMIT 10
+            """
+        )
+        for row in feed_rows:
+            notional_val = float(row.notional if row.notional is not None else (row.size or 0.0))
+            direction = "+" if (row.side or "").upper() in ("YES", "BUY") else "-"
+            news_events.append({
+                "trader":   row.trader_address[:12] + "...",
+                "label":    row.label.upper(),
+                "activity": f"{(row.side or '').upper()} ${notional_val:.2f}",
+                "impact":   f"{direction}{notional_val / 100:.1f}%",
+                "summary":  f"Entered {row.side} on '{row.question[:30]}...'",
+            })
 
     # ------------------------------------------------------------------ #
     # 4. Open Positions (for the bot wallet)                               #
@@ -222,11 +238,13 @@ async def map_db_to_bot_state(
     )
     open_positions = [
         {
-            "market":      row.question,
-            "side":        row.outcome_name.upper(),
-            "size":        round(row.current_size, 2),
-            "price":       round(row.avg_entry_price, 3),
-            "signal_type": "Live",
+            "market":       row.question,
+            "side":         row.outcome_name.upper(),
+            "size":         round(row.current_size * row.avg_entry_price, 2),  # USDC cost
+            "shares":       round(row.current_size, 4),
+            "price":        round(row.avg_entry_price, 3),
+            "unrealized":   round(row.unrealized_pnl, 2),
+            "signal_type":  "Live",
         }
         for row in pos_rows
     ]
@@ -241,9 +259,11 @@ async def map_db_to_bot_state(
         FROM closed_positions cp
         JOIN markets m  ON m.id  = cp.market_id
         JOIN outcomes o ON o.id  = cp.outcome_id
+        WHERE cp.trader_address = ?
         ORDER BY cp.closed_at DESC
         LIMIT 20
-        """
+        """,
+        (bot_address,),
     )
     resolved_positions = [
         {
@@ -268,7 +288,7 @@ async def map_db_to_bot_state(
             "total_trades": total_trades,
             "win_rate":     win_rate_pct,
             "total_profit": round(total_profit, 2),
-            "balance":      round(settings.app.paper_balance + total_profit, 2),
+            "balance":      round(settings.app.paper_balance, 2),
         },
         "total_scanned":      real_signal_count,
         "scanned_markets":    scanned_markets,

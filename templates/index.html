@@ -82,8 +82,9 @@
                                 <tr>
                                     <th>Market</th>
                                     <th>Side</th>
-                                    <th>Size</th>
+                                    <th>Cost (USDC)</th>
                                     <th>Entry</th>
+                                    <th>Unrealized P&L</th>
                                     <th>Signal Type</th>
                                 </tr>
                             </thead>
@@ -214,13 +215,10 @@
                                         <option value="long_range">Long-Range Forecast (Domain Experts)</option>
                                         <option value="volatility">Volatility Arbitrage (Whale Conviction)</option>
                                     </optgroup>
-                                    <optgroup label="Weather Specialist">
+                                    <optgroup label="Weather &amp; Disaster">
                                         <option value="weather_prediction">Weather Prediction (ECMWF 51-Member Ensemble)</option>
                                         <option value="laddering">Temperature Ladder — Adjacent Buckets (neobrother)</option>
-                                        <option value="disaster">Disaster Early Warning</option>
-                                    </optgroup>
-                                    <optgroup label="Geophysical / External Data">
-                                        <option value="seismic">Seismic / Earthquake (USGS)</option>
+                                        <option value="disaster">Disaster &amp; Seismic (USGS + Open-Meteo)</option>
                                     </optgroup>
                                 </select>
                             </div>
@@ -240,8 +238,8 @@
                                 <input type="number" id="s-edge" step="0.01" value="0.20">
                             </div>
                             <div class="form-group">
-                                <label>Market Refresh Interval (Minutes, min 30)</label>
-                                <input type="number" id="s-interval" value="30" min="30">
+                                <label>Market Refresh Interval (Minutes, min 5)</label>
+                                <input type="number" id="s-interval" value="5" min="5">
                             </div>
                             <div class="form-group">
                                 <label>Initial Paper Balance ($)</label>
@@ -250,6 +248,16 @@
                             <div class="form-group">
                                 <label>Max Open Trades</label>
                                 <input type="number" id="s-max-trades" value="10">
+                            </div>
+                            <div class="form-group">
+                                <label>Take Profit (%)</label>
+                                <input type="number" id="s-take-profit" value="50" min="1" max="999" step="1"
+                                       title="Close position when price rises this % above entry">
+                            </div>
+                            <div class="form-group">
+                                <label>Stop Loss (%)</label>
+                                <input type="number" id="s-stop-loss" value="30" min="1" max="99" step="1"
+                                       title="Close position when price falls this % below entry">
                             </div>
                             <button type="submit" class="btn btn-primary">Save Settings</button>
                         </form>

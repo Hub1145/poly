@@ -17,6 +17,7 @@ from packages.tasks.refresh_trades import refresh_trades
 from packages.tasks.recompute_features import refresh_trader_profiles
 from packages.tasks.compute_signals import refresh_market_signals
 from packages.tasks.execute_signals import execute_signals
+from packages.tasks.manage_positions import manage_positions
 
 logger = logging.getLogger("polymarket_alpha_ui")
 
@@ -54,9 +55,15 @@ bot_state: Dict[str, Any] = {
     },
 }
 
-SIGNAL_CYCLE_SECONDS  = 30
-TRADE_CYCLE_SECONDS   = 60
-MARKET_CYCLE_MIN      = 30
+SIGNAL_CYCLE_SECONDS  = 60    # re-score cached markets every 1 minute
+TRADE_CYCLE_SECONDS   = 120   # refresh trade history every 2 minutes
+MARKET_CYCLE_MIN      = 5     # fetch new markets from Polymarket every 5 minutes
+
+# Strategies that rely on skilled-trader data (whale/SNW/specialist).
+# All others use price-structure or external data — skip trade ingestion for them.
+_TRADER_STRATEGIES = frozenset({
+    "bayesian_ensemble", "conservative_snw", "aggressive_whale", "specialist_precision",
+})
 
 # Model run burst-scan: NOAA/ECMWF/GFS update at 00Z, 06Z, 12Z, 18Z UTC.
 # Within BURST_WINDOW_MIN minutes of a model run, scan every BURST_CYCLE_SECONDS.
@@ -124,7 +131,7 @@ async def background_workers_loop():
       Layer 2 — Trade/Position cycle (every 60 s, only when bot is running):
         Refresh trade history and re-compute trader profiles from CLOB.
 
-      Layer 3 — Market fetch cycle (every scan_interval min, min 30):
+      Layer 3 — Market fetch cycle (every scan_interval min, min 5):
         Pull new markets from Polymarket Gamma API for the active strategy.
         Skipped if the strategy was fetched < 1 hour ago (uses cached DB data).
     """
@@ -151,6 +158,10 @@ async def background_workers_loop():
 
     asyncio.create_task(_derive_creds())
 
+    # Pre-set fetch time so the main loop's first iteration doesn't also
+    # trigger a market fetch while _startup_phase1 is already running one.
+    _last_market_fetch_time = time.monotonic()
+
     # ── Phase 1: market fetch + first-pass signals (runs immediately) ───────
     # No is_scanning overlay during startup — the fallback rows already show
     # in the scan table while this runs in the background.  The scan tab is
@@ -174,20 +185,26 @@ async def background_workers_loop():
             last_trade_refresh               = _now
             logger.info("Startup phase 1 complete — signals live. Starting trade ingestion...")
 
-            # ── Phase 2: trade ingestion + profile rebuild (background) ────
-            async def _startup_phase2():
-                nonlocal last_trade_refresh
-                try:
-                    async with db_lock:
-                        await refresh_trades()
-                        await refresh_trader_profiles()
-                        await refresh_market_signals()
-                    last_trade_refresh = time.monotonic()
-                    logger.info("Startup phase 2 complete — trader profiles and signals updated.")
-                except Exception as exc:
-                    logger.error(f"Startup phase 2 (trade ingestion) failed: {exc}")
+            # ── Phase 2: trade ingestion + profile rebuild (trader strategies only) ─
+            if _startup_strategy in _TRADER_STRATEGIES:
+                async def _startup_phase2():
+                    nonlocal last_trade_refresh
+                    try:
+                        async with db_lock:
+                            await refresh_trades()
+                            await refresh_trader_profiles()
+                            await refresh_market_signals()
+                        last_trade_refresh = time.monotonic()
+                        logger.info("Startup phase 2 complete — trader profiles and signals updated.")
+                    except Exception as exc:
+                        logger.error(f"Startup phase 2 (trade ingestion) failed: {exc}")
 
-            asyncio.create_task(_startup_phase2())
+                asyncio.create_task(_startup_phase2())
+            else:
+                logger.info(
+                    f"Startup phase 2 skipped — strategy '{_startup_strategy}' "
+                    "does not use skilled-trader data."
+                )
 
         except Exception as exc:
             logger.error(f"Startup phase 1 failed: {exc}")
@@ -202,7 +219,7 @@ async def background_workers_loop():
             now              = time.monotonic()
             current_strategy = settings.strategy
             strategy_changed = current_strategy != _last_fetched_strategy
-            market_interval  = max(MARKET_CYCLE_MIN, settings.app.scan_interval) * 60
+            market_interval  = max(MARKET_CYCLE_MIN, settings.app.scan_interval) * 60  # seconds
             market_due       = (now - _last_market_fetch_time) >= market_interval
             trade_due        = (now - last_trade_refresh) >= TRADE_CYCLE_SECONDS
 
@@ -245,8 +262,8 @@ async def background_workers_loop():
                     _strategy_fetch_times[current_strategy] = _now_t
                     logger.info("[Market Update] Done.")
 
-                # ── Layer 2: Trade / position refresh ────────────────────────
-                if trade_due or has_force_sync:
+                # ── Layer 2: Trade / position refresh (trader strategies only) ───
+                if (trade_due or has_force_sync) and current_strategy in _TRADER_STRATEGIES:
                     logger.info("[Trade Refresh] Updating positions...")
                     await refresh_trades()
                     await refresh_trader_profiles()
@@ -275,8 +292,9 @@ async def background_workers_loop():
                     signals_found = await refresh_market_signals()
                     logger.info(f"[Progressive] Expanded — {signals_found} signals now available.")
 
-                # ── Layer 0: Execute trades on top signals ────────────────────
+                # ── Layer 0: Manage open positions (TP/SL) + execute new trades ─
                 if is_trading:
+                    await manage_positions()
                     logger.info("[Execute] Evaluating signals for trade execution...")
                     await execute_signals()
 
@@ -346,6 +364,7 @@ async def update_config(request: Request):
     allowed_keys = {
         "strategy", "paper_mode", "trade_amount",
         "min_edge", "scan_interval", "paper_balance", "max_trades",
+        "take_profit", "stop_loss",
     }
     for key in allowed_keys:
         if key in data:
@@ -374,6 +393,10 @@ async def update_config(request: Request):
         settings.app.paper_balance = float(data["paper_balance"])
     if "max_trades" in data:
         settings.app.max_trades = int(data["max_trades"])
+    if "take_profit" in data:
+        settings.app.take_profit = float(data["take_profit"])
+    if "stop_loss" in data:
+        settings.app.stop_loss = float(data["stop_loss"])
 
     if "strategy" in data:
         old_strategy = settings.strategy
@@ -402,6 +425,8 @@ async def get_config():
         "strategy":            settings.strategy,
         "paper_balance":       settings.app.paper_balance,
         "max_trades":          settings.app.max_trades,
+        "take_profit":         settings.app.take_profit,
+        "stop_loss":           settings.app.stop_loss,
     })
 
 
