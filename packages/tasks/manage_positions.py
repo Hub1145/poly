@@ -1,13 +1,19 @@
 """
-Position Manager — Take Profit & Stop Loss
-==========================================
+Position Manager — Market Resolution + Take Profit & Stop Loss
+==============================================================
 Runs on every signal cycle.  For each open bot position:
 
-  - Fetches the current YES/NO price from price_snapshots.
-  - Compares against entry price using configured TP/SL percentages.
-  - If TP or SL is hit:
-      Paper mode : writes to closed_positions, restores paper_balance.
-      Live mode  : places a market-sell order via py_clob_client, then records.
+  1. Resolution check (highest priority):
+       Detects if the market has closed on Polymarket (closed=1, active=0 in DB).
+       Fetches the final outcomePrices from the Gamma API.
+       Settles at 1.0 (WIN) or 0.0 (LOSS) immediately — no waiting for TP/SL.
+
+  2. TP/SL check (while market is still live):
+       - Fetches the current YES/NO price from price_snapshots.
+       - Compares against entry price using configured TP/SL percentages.
+       - If TP or SL is hit:
+           Paper mode : writes to closed_positions, restores paper_balance.
+           Live mode  : places a market-sell order via py_clob_client, then records.
 
 TP/SL logic
 -----------
@@ -16,19 +22,137 @@ TP/SL logic
 
 Prices here are Polymarket outcome-token prices (0.0–1.0).
 """
+import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from packages.db.database import get_db
 from packages.core.config import settings
 from packages.ingestion.clients.polymarket_http import (
+    GammaClient,
     _derived_api_key, _derived_api_secret, _derived_api_passphrase,
 )
 
 logger = logging.getLogger(__name__)
 
 BOT_PAPER_ADDRESS = "0xbot_paper_wallet"
+
+
+async def _get_resolved_price(db, market_id: str, outcome_id: int) -> Optional[float]:
+    """
+    Check whether a market has fully resolved on Polymarket.
+
+    Returns:
+      1.0  — our outcome WON (settle at full value)
+      0.0  — our outcome LOST (settle at zero)
+      None — market is still live; fall through to TP/SL logic
+    """
+    # Proceed if DB says closed OR if the market's end date has already passed.
+    # Resolved markets drop out of the active feed so the closed flag may lag;
+    # checking end_date_iso catches that gap without hammering the API for live markets.
+    market_meta = await db.fetchone(
+        "SELECT closed, active, end_date_iso FROM markets WHERE id=?",
+        (market_id,),
+    )
+    if not market_meta:
+        return None
+
+    already_closed = market_meta["closed"] and not market_meta["active"]
+    end_date_str   = market_meta["end_date_iso"]
+    past_end = False
+    if end_date_str:
+        try:
+            end_dt   = datetime.fromisoformat(str(end_date_str).replace("Z", "+00:00"))
+            now_utc  = datetime.now(timezone.utc)
+            past_end = now_utc > end_dt
+        except ValueError:
+            pass
+
+    if not already_closed and not past_end:
+        return None
+
+    # Look up the outcome name (Yes / No) and the event_id we need for the API call.
+    meta = await db.fetchone(
+        """
+        SELECT o.name AS outcome_name, m.event_id
+        FROM outcomes o
+        JOIN markets m ON m.id = o.market_id
+        WHERE o.id = ? AND m.id = ?
+        """,
+        (outcome_id, market_id),
+    )
+    if not meta:
+        return None
+
+    outcome_name = (meta["outcome_name"] or "Yes").strip().lower()
+    event_id     = meta["event_id"]
+
+    # Fetch live outcomePrices from Gamma API — the single source of truth for
+    # resolved prices (1.0 / 0.0).  Use a fresh client; close it right after.
+    gc = GammaClient()
+    try:
+        raw_event = await gc.get_event(str(event_id))
+    except Exception as e:
+        logger.warning(f"[Resolve] Gamma API fetch failed for event {event_id}: {e}")
+        return None
+    finally:
+        await gc.close()
+
+    # Find the specific market inside the event.
+    raw_markets = raw_event.get("markets", [])
+    target = next((m for m in raw_markets if str(m.get("id", "")) == str(market_id)), None)
+    if not target:
+        return None
+
+    # Parse outcomePrices — Gamma returns either a JSON string or a list.
+    prices_raw = target.get("outcomePrices", [])
+    if isinstance(prices_raw, str):
+        try:
+            prices = json.loads(prices_raw)
+        except Exception:
+            return None
+    else:
+        prices = prices_raw or []
+
+    # Parse outcome names (same encoding quirk).
+    names_raw = target.get("outcomes", '["Yes","No"]')
+    if isinstance(names_raw, str):
+        try:
+            names = json.loads(names_raw)
+        except Exception:
+            names = ["Yes", "No"]
+    else:
+        names = names_raw or ["Yes", "No"]
+
+    # Match our outcome by name to find its index in the prices list.
+    our_idx = next(
+        (i for i, n in enumerate(names) if (n or "").strip().lower() == outcome_name),
+        None,
+    )
+    if our_idx is None or our_idx >= len(prices):
+        return None
+
+    try:
+        price = float(prices[our_idx])
+    except (ValueError, TypeError):
+        return None
+
+    if price >= 0.95:
+        logger.info(
+            f"[Resolve] Market {market_id[:16]}... RESOLVED WIN "
+            f"(outcome='{outcome_name}', price={price:.2f})"
+        )
+        return 1.0
+    if price <= 0.05:
+        logger.info(
+            f"[Resolve] Market {market_id[:16]}... RESOLVED LOSS "
+            f"(outcome='{outcome_name}', price={price:.2f})"
+        )
+        return 0.0
+
+    # Price is mid-range on a closed market — unusual, skip and let TP/SL handle it.
+    return None
 
 
 async def _get_current_price(db, market_id: str, outcome_id: int) -> Optional[float]:
@@ -187,6 +311,24 @@ async def manage_positions() -> int:
         asset_id    = row["asset_id"]
         pos_id      = row["id"]
 
+        # ── 1. Resolution check (market fully closed on Polymarket) ────────────
+        resolved_price = await _get_resolved_price(db, market_id, outcome_id)
+        if resolved_price is not None:
+            reason = (
+                f"MARKET RESOLVED {'WIN' if resolved_price >= 0.95 else 'LOSS'} "
+                f"(settlement={resolved_price:.2f})"
+            )
+            ok = await _close_position(
+                db, pos_id, bot_address,
+                market_id, outcome_id,
+                shares, entry_price, resolved_price,
+                reason, asset_id, paper_mode,
+            )
+            if ok:
+                closed += 1
+            continue  # no need to check TP/SL for a resolved market
+
+        # ── 2. TP/SL check (market still live) ─────────────────────────────
         current_price = await _get_current_price(db, market_id, outcome_id)
         if current_price is None:
             continue

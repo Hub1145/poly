@@ -450,7 +450,7 @@ def _bucket_probability(
 
     # "between X and Y" / "X–Y" / "X to Y" bucket
     between = re.search(
-        r"between\s+(\d+(?:\.\d+)?)\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q
+        r"between\s+(\d+(?:\.\d+)?)\s*°?\s*[fcFC]?\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q
     )
     if not between:
         # "X-Y°F" format with no "between" keyword
@@ -564,7 +564,7 @@ async def compute_weather_alpha(
         return None
 
     # Detect unit: Fahrenheit vs Celsius
-    unit = "F" if re.search(r"\bF\b|fahrenheit", question, re.IGNORECASE) else "C"
+    unit = "F" if re.search(r"fahrenheit|\bF\b|\d\s*°?\s*F\b", question, re.IGNORECASE) else "C"
 
     # Check if target date is in the past
     utc_offset_h = round(coords["lon"] / 15.0)
@@ -844,7 +844,7 @@ def _extract_market_threshold(question: str, unit: str) -> Optional[float]:
     """
     q = question.lower()
     between = re.search(
-        r"between\s+(\d+(?:\.\d+)?)\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q
+        r"between\s+(\d+(?:\.\d+)?)\s*°?\s*[fcFC]?\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q
     )
     if not between:
         between = re.search(
@@ -914,7 +914,7 @@ async def precompute_temperature_bucket_winners(markets: list) -> None:
         if not target_date:
             continue
         city_name, coords = city_result
-        unit = "F" if re.search(r"\bF\b|fahrenheit", q, re.IGNORECASE) else "C"
+        unit = "F" if re.search(r"fahrenheit|\bF\b|\d\s*°?\s*F\b", q, re.IGNORECASE) else "C"
         key = (city_name.lower(), target_date, unit)
         groups[key].append((m, coords, unit))
 
@@ -971,7 +971,7 @@ def _ensemble_probability(daily_maxes: list, question: str, unit: str) -> Option
 
     # "between X and Y" / "X-Y°F" bucket
     between = re.search(
-        r"between\s+(\d+(?:\.\d+)?)\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q
+        r"between\s+(\d+(?:\.\d+)?)\s*°?\s*[fcFC]?\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q
     )
     if not between:
         between = re.search(
@@ -1023,17 +1023,13 @@ async def compute_ladder_weather_alpha(
     current_price: float,
 ) -> Optional[Tuple[float, str]]:
     """
-    Laddering strategy scorer for temperature bucket markets.
+    Laddering scorer for temperature bucket markets.
 
-    Unlike compute_ensemble_weather_alpha which forces NO on all non-winning
-    buckets, this function:
-      - Scores the WINNER bucket as a strong YES
-      - Scores ADJACENT buckets as YES if the model still gives them meaningful
-        probability (don't force them NO just because a neighbour is better)
-      - Only forces NO on buckets the model considers clearly overpriced
+    For a set of competing buckets for city X (e.g. "Will X be 70°F?", "80°F?", "90°F?"):
+      - YES on the ONE bucket whose threshold is within 2°F / 1°C of the ensemble mean
+      - NO on ALL other buckets (they cannot resolve YES — mutual exclusivity)
 
-    This produces YES signals on 2-3 adjacent buckets per city+date, which
-    the execute engine distributes as ladder legs at reduced per-leg sizing.
+    One YES, rest NO. Never YES on adjacent buckets.
     """
     weather_type = _detect_weather_type(question)
     if weather_type not in ("temperature",):
@@ -1048,7 +1044,7 @@ async def compute_ladder_weather_alpha(
     if not target_date:
         return None
 
-    unit = "F" if re.search(r"\bF\b|fahrenheit", question, re.IGNORECASE) else "C"
+    unit = "F" if re.search(r"fahrenheit|\bF\b|\d\s*°?\s*F\b", question, re.IGNORECASE) else "C"
 
     utc_offset_h = round(coords["lon"] / 15.0)
     local_now    = _dt.now(_tz.utc) + _td(hours=utc_offset_h)
@@ -1077,10 +1073,6 @@ async def compute_ladder_weather_alpha(
     if len(member_temps) < 5:
         return None
 
-    forecast_prob = _ensemble_probability(member_temps, question, unit)
-    if forecast_prob is None:
-        return None
-
     n_members     = len(member_temps)
     ensemble_mean = sum(member_temps) / n_members
     ensemble_spread = max(member_temps) - min(member_temps)
@@ -1091,69 +1083,59 @@ async def compute_ladder_weather_alpha(
         model_label = f"GEFS-{n_members}"
     else:
         model_label = f"ICON-{n_members}"
-    is_focus      = city_name in HIGH_VOLUME_CITIES
-    focus_tag     = "" if is_focus else " [non-priority city]"
-    ref_label     = "low" if is_low_market else "high"
+    is_focus  = city_name in HIGH_VOLUME_CITIES
+    focus_tag = "" if is_focus else " [non-priority city]"
+    ref_label = "low" if is_low_market else "high"
+
+    # This bucket's threshold
+    market_threshold = _extract_market_threshold(question, unit)
+    if market_threshold is None:
+        return None
+
+    temp_diff = ensemble_mean - market_threshold  # positive = forecast above bucket
+    abs_diff  = abs(temp_diff)
+
+    # Match tolerance: 2°F or 1°C — if forecast is this close to the bucket, it's the winner
+    match_tol = 2.0 if unit == "F" else 1.0
+
+    forecast_prob = _ensemble_probability(member_temps, question, unit)
+    if forecast_prob is None:
+        return None
 
     min_gap = WEATHER_MIN_GAP_PP / 100.0
     gap     = forecast_prob - current_price
 
-    # ── Bucket winner check ───────────────────────────────────────────────────
-    winner_key = (city_name.lower(), target_date, unit)
-    is_winner  = True
-    if winner_key in _BUCKET_WINNERS:
-        winner_q = _BUCKET_WINNERS[winner_key]
-        this_q   = question.lower()
-        if this_q != winner_q:
-            is_winner = False
-
-    market_threshold = _extract_market_threshold(question, unit)
-    temp_diff = (ensemble_mean - market_threshold) if market_threshold is not None else 0.0
-
-    # ── Adjacency: within 1 ensemble std-dev of the forecast mean ────────────
-    # ensemble_spread is max-min of all members; divide by 4 ≈ 1 sigma.
-    # Only buckets whose threshold falls within this range of the mean are
-    # considered "adjacent" — tighter than a loose gap check.
-    ensemble_sigma  = max(1.5, ensemble_spread / 4.0)
-    is_truly_adjacent = (
-        market_threshold is not None
-        and abs(market_threshold - ensemble_mean) <= ensemble_sigma
-        and not is_winner
-    )
-
-    if is_winner:
-        # Winner bucket: signal YES if model shows meaningful edge
+    if abs_diff <= match_tol:
+        # Forecast matches this bucket — signal YES
         if gap < min_gap:
-            return None
+            return None  # market already correctly priced
         edge = gap
-        rule = f"WINNER YES (P={forecast_prob*100:.0f}%, market={current_price*100:.0f}%, gap={gap:+.2f})"
-    elif is_truly_adjacent:
-        # Genuinely adjacent bucket (within forecast uncertainty): smaller YES leg
-        if gap <= 0:
-            return None   # model doesn't support this bucket at all
-        edge = gap * 0.5  # half strength vs winner — clearly secondary
-        rule = f"ADJACENT YES within {ensemble_sigma:.1f}{unit} sigma (P={forecast_prob*100:.0f}%, gap={gap:+.2f})"
+        rule = (
+            f"FORECAST MATCH -> YES "
+            f"(ensemble {ensemble_mean:.1f}{unit}, bucket {market_threshold:.1f}{unit}, "
+            f"diff={temp_diff:+.1f}{unit}, P={forecast_prob*100:.0f}%, "
+            f"market={current_price*100:.0f}%)"
+        )
     else:
-        # Not adjacent and not the winner → NO if clearly overpriced, else skip
-        if gap < -min_gap:
-            edge = gap
-            rule = f"NO (P={forecast_prob*100:.0f}% far below market={current_price*100:.0f}%)"
-        else:
-            return None  # neutral, skip
+        # Forecast clearly misses this bucket — signal NO on the loser
+        if gap >= -0.03:
+            return None  # market already near-zero priced — no edge to fade
+        edge = gap
+        rule = (
+            f"FORECAST MISMATCH -> NO "
+            f"(ensemble {ensemble_mean:.1f}{unit}, bucket {market_threshold:.1f}{unit}, "
+            f"diff={temp_diff:+.1f}{unit}, P={forecast_prob*100:.0f}%, "
+            f"market={current_price*100:.0f}%)"
+        )
 
     if abs(edge) < 0.03:
         return None
 
-    market_part = (
-        f"Threshold {market_threshold:.1f}{unit} (diff={temp_diff:+.1f}{unit})"
-        if market_threshold is not None else "N/A"
-    )
-    bucket_label = "WINNER" if is_winner else ("ADJACENT" if is_truly_adjacent else "NO")
-    explanation  = (
-        f"[Ladder-{bucket_label}{focus_tag}] {city_name} {target_date} | "
+    explanation = (
+        f"[Ladder{focus_tag}] {city_name} {target_date} | "
         f"{model_label} {source}: forecast {ref_label} {ensemble_mean:.1f}{unit} "
         f"(+/-{ensemble_spread/2:.1f}, {n_members} members) | "
-        f"{market_part} | "
+        f"Bucket {market_threshold:.1f}{unit} (diff={temp_diff:+.1f}{unit}) | "
         f"P(condition)={forecast_prob*100:.1f}% vs {current_price*100:.1f}% priced | "
         f"Rule: {rule}. Edge={edge:+.3f}."
     )
@@ -1190,7 +1172,7 @@ async def compute_ensemble_weather_alpha(
     if not target_date:
         return None
 
-    unit = "F" if re.search(r"\bF\b|fahrenheit", question, re.IGNORECASE) else "C"
+    unit = "F" if re.search(r"fahrenheit|\bF\b|\d\s*°?\s*F\b", question, re.IGNORECASE) else "C"
 
     # Date check
     utc_offset_h = round(coords["lon"] / 15.0)
@@ -1384,7 +1366,7 @@ def _parse_precip_threshold(question: str) -> Optional[Dict[str, Any]]:
     q = question.lower()
 
     # "between X and Y" / "X-Y mm" / "X-Y inches"
-    between = re.search(r"between\s+(\d+(?:\.\d+)?)\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q)
+    between = re.search(r"between\s+(\d+(?:\.\d+)?)\s*°?\s*[fcFC]?\s*(?:and|-|to)\s*(\d+(?:\.\d+)?)", q)
     if not between:
         between = re.search(
             r"(\d+(?:\.\d+)?)\s*[-–]\s*(\d+(?:\.\d+)?)\s*(?:mm\b|inches?\b|in\b)", q

@@ -1,7 +1,7 @@
 import json
 from typing import Any, Dict, List
 
-from packages.core.config import settings
+from packages.core.config import settings, log_buffer
 from packages.db.database import get_db
 
 # Maps the active strategy setting → signal_type values stored in market_signal_snapshots.
@@ -65,13 +65,6 @@ async def map_db_to_bot_state(
         "SELECT COUNT(id) FROM position_snapshots WHERE trader_address=?",
         (bot_address,),
     ) or 0
-
-    skilled_count = 0
-    if active_strategy in _TRADER_STRATEGIES:
-        skilled_count = await db.fetchval(
-            "SELECT COUNT(address) FROM trader_classifications"
-            " WHERE label IN ('whale','serious_non_whale','topic_specialist')"
-        ) or 0
 
     win_row = await db.fetchone(
         """
@@ -226,7 +219,7 @@ async def map_db_to_bot_state(
     # ------------------------------------------------------------------ #
     pos_rows = await db.fetchall(
         """
-        SELECT ps.current_size, ps.avg_entry_price,
+        SELECT ps.current_size, ps.avg_entry_price, ps.unrealized_pnl,
                m.question, o.name AS outcome_name
         FROM position_snapshots ps
         JOIN markets m  ON m.id  = ps.market_id
@@ -296,14 +289,7 @@ async def map_db_to_bot_state(
         "resolved_positions": resolved_positions,
         "news_events":        news_events,
         "dev_check_logs":     dev_check_logs,
-        "logs": [
-            f"Strategy: {active_strategy} | "
-            f"Signals: {real_signal_count} | "
-            f"Bot trades: {total_trades} open+closed | "
-            f"Win rate: {win_rate_pct}% | "
-            f"Balance: ${round(settings.app.paper_balance + total_profit, 2):.2f} | "
-            f"Skilled traders tracked: {skilled_count}"
-        ],
+        "logs": log_buffer.get_entries(60),
         "config": {
             "paper_mode":    settings.app.paper_mode,
             "trade_amount":  settings.app.trade_amount,
@@ -312,5 +298,7 @@ async def map_db_to_bot_state(
             "strategy":      settings.strategy,
             "paper_balance": settings.app.paper_balance,
             "max_trades":    settings.app.max_trades,
+            "take_profit":   settings.app.take_profit,
+            "stop_loss":     settings.app.stop_loss,
         },
     }

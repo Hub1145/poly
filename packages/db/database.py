@@ -405,4 +405,18 @@ def init_db() -> None:
         );
     """)
     c.commit()
+
+    # ── Column migrations (safe no-ops if already present) ────────────────────
+    # ALTER TABLE ADD COLUMN fails if the column already exists; catch and ignore.
+    _migrations = [
+        "ALTER TABLE position_snapshots ADD COLUMN unrealized_pnl REAL NOT NULL DEFAULT 0.0",
+        "ALTER TABLE markets ADD COLUMN resolution_source TEXT",
+    ]
+    for sql in _migrations:
+        try:
+            c.execute(sql)
+            c.commit()
+        except Exception:
+            pass  # column already exists — safe to ignore
+
     logger.info("Database tables created / verified.")

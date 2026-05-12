@@ -1,5 +1,6 @@
 import json
 import logging
+from collections import deque
 from pathlib import Path
 
 from pydantic import BaseModel, Field
@@ -12,6 +13,29 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("polymarket_alpha")
+
+
+class _LogBuffer(logging.Handler):
+    """In-memory circular buffer — feeds the dashboard Logs panel."""
+    MAX_ENTRIES = 150
+
+    def __init__(self):
+        super().__init__()
+        self._entries: deque = deque(maxlen=self.MAX_ENTRIES)
+        self.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._entries.append(self.format(record))
+        except Exception:
+            pass
+
+    def get_entries(self, n: int = 60) -> list:
+        return list(self._entries)[-n:]
+
+
+log_buffer = _LogBuffer()
+logging.getLogger().addHandler(log_buffer)
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent.resolve()
 SETTINGS_FILE = PROJECT_ROOT / "settings.json"
