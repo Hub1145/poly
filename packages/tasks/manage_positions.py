@@ -63,9 +63,10 @@ async def _get_resolved_price(db, market_id: str, outcome_id: int) -> Optional[f
     past_end = False
     if end_date_str:
         try:
-            end_dt   = datetime.fromisoformat(str(end_date_str).replace("Z", "+00:00"))
-            now_utc  = datetime.now(timezone.utc)
-            past_end = now_utc > end_dt
+            end_dt = datetime.fromisoformat(str(end_date_str).replace("Z", "+00:00"))
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            past_end = datetime.now(timezone.utc) > end_dt
         except ValueError:
             pass
 

@@ -1395,41 +1395,78 @@ async def _fetch_monthly_precipitation(
     lat: float, lon: float, year: int, month: int, precip_unit: str
 ) -> Optional[float]:
     """
-    Fetch the total monthly precipitation for (lat, lon) from the Open-Meteo
-    historical-forecast API. Covers both past actuals and remaining forecast days
-    in one call. Returns the sum in the requested unit ("mm" or "inch").
+    Fetch total monthly precipitation from Open-Meteo.
+
+    Splits the request so each API gets only the dates it supports:
+      - historical-forecast-api: past dates (up to yesterday)
+      - forecast API (api.open-meteo.com): today and future dates (up to 16 days)
+
+    Returns the combined sum in the requested unit ("mm" or "inch").
     """
     import calendar
     _, last_day = calendar.monthrange(year, month)
-    start_date  = f"{year}-{month:02d}-01"
-    end_date    = f"{year}-{month:02d}-{last_day:02d}"
+    month_start = _date(year, month, 1)
+    month_end   = _date(year, month, last_day)
+    today       = _dt.now(_tz.utc).date()
+    yesterday   = today - _td(days=1)
 
     key = ("precip_monthly", round(lat, 4), round(lon, 4), year, month, precip_unit)
     cached = _get_cached(key)
     if cached is not None:
         return cached
 
-    params: Dict[str, Any] = {
-        "latitude":          lat,
-        "longitude":         lon,
-        "start_date":        start_date,
-        "end_date":          end_date,
-        "daily":             "precipitation_sum",
-        "timezone":          "auto",
+    base_params: Dict[str, Any] = {
+        "latitude":           lat,
+        "longitude":          lon,
+        "daily":              "precipitation_sum",
+        "timezone":           "auto",
         "precipitation_unit": precip_unit,
     }
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(HISTORICAL_FORECAST_URL, params=params)
-            resp.raise_for_status()
-            data        = resp.json()
-            daily_sums  = data.get("daily", {}).get("precipitation_sum", [])
-            total       = sum(v for v in daily_sums if v is not None)
-            _set_cached(key, total)
-            return total
-    except Exception as e:
-        logger.warning(f"[Precip] Monthly fetch failed ({lat:.2f},{lon:.2f}): {e}")
+
+    total = 0.0
+    got_any = False
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        # ── Past portion: historical-forecast-api (start of month → yesterday) ──
+        hist_end = min(yesterday, month_end)
+        if hist_end >= month_start:
+            params = {
+                **base_params,
+                "start_date": str(month_start),
+                "end_date":   str(hist_end),
+            }
+            try:
+                resp = await client.get(HISTORICAL_FORECAST_URL, params=params)
+                resp.raise_for_status()
+                sums  = resp.json().get("daily", {}).get("precipitation_sum", [])
+                total += sum(v for v in sums if v is not None)
+                got_any = True
+            except Exception as e:
+                logger.warning(f"[Precip] Historical fetch failed ({lat:.2f},{lon:.2f}): {e}")
+
+        # ── Future portion: forecast API (today → end of month, max 16 days) ──
+        fc_start = max(today, month_start)
+        fc_end   = min(month_end, today + _td(days=15))
+        if fc_start <= month_end and fc_start <= fc_end:
+            params = {
+                **base_params,
+                "start_date": str(fc_start),
+                "end_date":   str(fc_end),
+            }
+            try:
+                resp = await client.get(OPEN_METEO_URL, params=params)
+                resp.raise_for_status()
+                sums  = resp.json().get("daily", {}).get("precipitation_sum", [])
+                total += sum(v for v in sums if v is not None)
+                got_any = True
+            except Exception as e:
+                logger.warning(f"[Precip] Forecast fetch failed ({lat:.2f},{lon:.2f}): {e}")
+
+    if not got_any:
         return None
+
+    _set_cached(key, total)
+    return total
 
 
 async def precompute_precipitation_bucket_winners(markets: list) -> None:
